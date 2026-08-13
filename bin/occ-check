@@ -13,7 +13,6 @@ class SystemAudit:
         load = os.getloadavg() if hasattr(os, 'getloadavg') else (0, 0, 0)
         print(f"[+] System Load Average : {load[0]:.2f} / {load[1]:.2f} / {load[2]:.2f}")
         
-        # RAM usage
         try:
             with open('/proc/meminfo', 'r') as f:
                 mem = {}
@@ -54,11 +53,11 @@ class SystemAudit:
         try:
             sar_q = subprocess.check_output(['sar', '-q'], stderr=subprocess.DEVNULL).decode('utf-8', errors='ignore')
         except Exception:
-            sar_q = "SAR -q unavailable"
+            sar_q = ""
         try:
             sar_r = subprocess.check_output(['sar', '-r'], stderr=subprocess.DEVNULL).decode('utf-8', errors='ignore')
         except Exception:
-            sar_r = "SAR -r unavailable"
+            sar_r = ""
         return sar_q, sar_r
 
 class TrafficCollector:
@@ -82,7 +81,6 @@ class TrafficCollector:
         wplogin_hits = []
         total_hits = 0
 
-        # Standard Log Regex
         log_pattern = re.compile(
             r'^(?P<ip>\S+) \S+ \S+ \[.*?\] "(?:GET|POST|HEAD) (?P<uri>\S+)'
             r'.*?" (?P<status>\d{3}) \S+ "(?P<ref>.*?)" "(?P<ua>.*?)"'
@@ -140,7 +138,7 @@ def main():
     print("\n--- Aggregated RAM Usage by Process ---")
     for proc, mem_mb in SystemAudit.get_process_ram():
         if mem_mb >= 1024:
-            print(f"  {proc:<45} {mem_mb/1024.2f} GB")
+            print(f"  {proc:<45} {mem_mb / 1024:.2f} GB")
         else:
             print(f"  {proc:<45} {mem_mb:.2f} MB")
 
@@ -177,8 +175,9 @@ def main():
 
     print("\n--- SAR Historical Stats ---")
     sar_q, sar_r = SystemAudit.get_sar_summary()
-    print(">>> Queue / Load History (sar -q):")
-    print("\n".join(sar_q.splitlines()[-6:]) if sar_q else "N/A")
+    if sar_q:
+        print(">>> Queue / Load History (sar -q):")
+        print("\n".join(sar_q.splitlines()[-6:]))
     print("========================================================")
 
 if __name__ == '__main__':
