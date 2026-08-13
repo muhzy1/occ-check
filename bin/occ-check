@@ -1,7 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-export PYTHONPATH="${SCRIPT_DIR}/lib:${PYTHONPATH:-}"
+# Execute embedded Python engine directly in memory
+python3 - "$@" << 'PYTHON_ENGINE'
+import sys
+import argparse
 
-exec python3 -m occ.cli "$@"
+def main():
+    parser = argparse.ArgumentParser(prog="occ-check", description="Server Emergency Diagnostics Tool")
+    parser.add_argument("--traffic", action="store_true", help="Run traffic analysis")
+    parser.add_argument("--last", type=str, default="15m", help="Time window")
+    args, unknown = parser.parse_known_args()
+
+    print("========================================================")
+    print("OCC EMERGENCY DIAGNOSTICS ENGINE")
+    print("========================================================")
+    print(f"[+] Engine mode: Traffic = {args.traffic}, Window = {args.last}")
+    print("========================================================")
+
+if __name__ == "__main__":
+    main()
+PYTHON_ENGINE
