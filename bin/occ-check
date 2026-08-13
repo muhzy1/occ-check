@@ -3,10 +3,10 @@ set -euo pipefail
 
 python3 - "$@" << 'PYTHON_ENGINE'
 import os
-import argparse
 import re
 import sys
 import glob
+import argparse
 import urllib.request
 import subprocess
 from datetime import datetime, timedelta
@@ -14,7 +14,7 @@ from collections import Counter
 
 class OOMCollector:
     OOM_PATTERN = re.compile(
-        r'\[(?P<timestamp>[^\]]+)\]\s+Out of memory:\s+Killed process\s+(?P<pid>\d+)\s+\((?P<process>[^\)]+)\)\s+total-vm:(?P<vm>\d+)kB,\s+anon-rss:(?P<rss>\d+)kB'
+        r'\[(?P<timestamp>[^\]]+)\]\s+Out of memory:\s+Killed process\+(x(?P<pid>\d+))?\s+\((?P<process>[^\)]+)\)\s+total-vm:(?P<vm>\d+)kB,\s+anon-rss:(?P<rss>\d+)kB'
     )
 
     def collect(self) -> dict:
@@ -77,7 +77,7 @@ class AccessLogCollector:
         "/etc/httpd/logs/access_log",
         "/usr/local/apache/logs/access_log",
     ]
-    LOG_PATTERN = re.compile(r'^(\S+)\s+.*?\[(\d{2}\/[A-Za-z]{3}\/\d{4}:\d{2}:\d{2}:\d{2})')
+    LOG_PATTERN = re.compile(r'^(?P<ip>\S+)\s+\S+\s+\S+\s+\[(?P<ts>\d{2}\/[A-Za-z]{3}\/\d{4}:\d{2}:\d{2}:\d{2})')
 
     def parse_window(self, window_str: str) -> timedelta:
         unit = window_str[-1].lower() if window_str else 'm'
@@ -119,7 +119,7 @@ class AccessLogCollector:
                 with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                     f.seek(0, os.SEEK_END)
                     size = f.tell()
-                    f.seek(max(0, size - 200000))
+                    f.seek(max(0, size - 2000000))
                     for line in f:
                         match = self.LOG_PATTERN.match(line)
                         if match:
@@ -180,7 +180,7 @@ def main():
     print(f"[+] Kernel OOM Events Detected: {oom['count']}")
     for event in oom['oom_events']:
         print(f"    - Killed PID {event['pid']} ({event['process']}) - Freed {event['rss_mb']} MB")
-        
+
     print(f"[+] Apache Scoreboard Available: {apache['available']}")
     if apache['available']:
         print(f"    - Busy Workers: {apache['busy_workers']}")
