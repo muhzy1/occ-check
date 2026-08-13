@@ -10,37 +10,26 @@ from datetime import datetime, timedelta
 from collections import Counter, defaultdict
 
 def parse_time_delta(time_str):
-    """Converts '15m', '1h', '24h', '30s' into a timedelta object."""
     unit = time_str[-1].lower()
     try:
         val = int(time_str[:-1])
     except ValueError:
         val = 1
         unit = 'h'
-
-    if unit == 's':
-        return timedelta(seconds=val)
-    elif unit == 'm':
-        return timedelta(minutes=val)
-    elif unit == 'h':
-        return timedelta(hours=val)
-    elif unit == 'd':
-        return timedelta(days=val)
+    if unit == 's': return timedelta(seconds=val)
+    if unit == 'm': return timedelta(minutes=val)
+    if unit == 'h': return timedelta(hours=val)
+    if unit == 'd': return timedelta(days=val)
     return timedelta(hours=1)
 
 class SystemAudit:
     @staticmethod
-    def get_load_and_mem():
+    def run_all():
         load = os.getloadavg() if hasattr(os, 'getloadavg') else (0, 0, 0)
         print(f"[+] System Load Average : {load[0]:.2f} / {load[1]:.2f} / {load[2]:.2f}")
-        
         try:
             with open('/proc/meminfo', 'r') as f:
-                mem = {}
-                for line in f:
-                    parts = line.split(':')
-                    if len(parts) == 2:
-                        mem[parts[0].strip()] = int(parts[1].split()[0])
+                mem = {line.split(':')[0].strip(): int(line.split(':')[1].split()[0]) for line in f if ':' in line}
             total_mb = mem.get('MemTotal', 0) / 1024
             free_mb = mem.get('MemAvailable', mem.get('MemFree', 0)) / 1024
             used_mb = total_mb - free_mb
@@ -49,318 +38,76 @@ class SystemAudit:
         except Exception:
             pass
 
+class ApacheAudit:
     @staticmethod
-    def get_process_ram():
-        proc_mem = defaultdict(float)
-        try:
-            output = subprocess.check_output(
-                ['ps', '-eo', 'rss,args'], stderr=subprocess.DEVNULL
-            ).decode('utf-8', errors='ignore')
-            
-            for line in output.splitlines()[1:]:
-                parts = line.strip().split(None, 1)
-                if len(parts) == 2:
-                    rss_kb, cmd = parts
-                    binary = cmd.split()[0]
-                    proc_mem[binary] += float(rss_kb) / 1024.0
-        except Exception:
-            pass
-        
-        return sorted(proc_mem.items(), key=lambda x: x[1], reverse=True)[:10]
-
-    @staticmethod
-    def get_sar_summary():
-        sar_q = ""
-        try:
-            sar_q = subprocess.check_output(['sar', '-q'], stderr=subprocess.DEVNULL).decode('utf-8', errors='ignore')
-        except Exception:
-            sar_q = ""
-        return sar_q
+    def check_scoreboard_and_errors():
+        print("\n--- Apache Configuration & Error Audit ---")
+        err_log = '/usr/local/apache/logs/error_log'
+        if os.path.exists(err_log):
+            try:
+                out = subprocess.check_output(['tail', '-n', '500', err_log], stderr=subprocess.DEVNULL).decode('utf-8', errors='ignore')
+                sb_errors = [l for l in out.splitlines() if 'AH03490' in l or 'scoreboard is full' in l]
+                if sb_errors:
+                    print(f"  [!] CRITICAL: Scoreboard full errors detected in Apache error log ({len(sb_errors)} recent hits)!")
+                    print("      -> Action Required: Increase ServerLimit in /etc/apache2/conf.d/includes/pre_virtualhost_global.conf")
+                else:
+                    print("  [+] Clean: No recent scoreboard full errors in Apache logs.")
+            except Exception:
+                pass
 
 class DiskAudit:
     @staticmethod
     def check_disks():
-        print("\n--- Disk & Storage Health ---")
+        print("\n--- Storage & Partition Health ---")
         try:
             df_out = subprocess.check_output(['df', '-hP'], stderr=subprocess.DEVNULL).decode('utf-8', errors='ignore')
-            lines = df_out.splitlines()
-            for line in lines[1:]:
+            for line in df_out.splitlines()[1:]:
                 parts = line.split()
                 if len(parts) >= 6:
-                    mount = parts[5]
-                    pct_str = parts[4].replace('%', '')
-                    if mount in ('/', '/var', '/tmp', '/home', '/usr') and pct_str.isdigit():
+                    mount, pct_str = parts[5], parts[4].replace('%', '')
+                    if pct_str.isdigit():
                         pct = int(pct_str)
                         flag = " [CRITICAL]" if pct >= 90 else (" [WARNING]" if pct >= 80 else "")
                         print(f"  * {mount:<15} : {parts[2]} used / {parts[1]} total ({parts[4]} used){flag}")
         except Exception:
-            print("  [!] Unable to query disk space.")
-
-class MySQLAudit:
-    @staticmethod
-    def check_config_and_status():
-        print("\n--- MySQL / MariaDB Diagnostics ---")
-        cnf_paths = ['/etc/my.cnf', '/etc/my.cnf.d/server.cnf', '/etc/mysql/my.cnf']
-        cnf_vars = {}
-        for path in cnf_paths:
-            if os.path.exists(path):
-                try:
-                    with open(path, 'r') as f:
-                        for line in f:
-                            line = line.strip()
-                            if line and not line.startswith(('#', '[')) and '=' in line:
-                                k, v = line.split('=', 1)
-                                cnf_vars[k.strip()] = v.strip()
-                except Exception:
-                    pass
-        
-        if cnf_vars:
-            print("  [+] Config Key Settings (/etc/my.cnf):")
-            for key in ['max_connections', 'innodb_buffer_pool_size', 'max_allowed_packet', 'tmp_table_size', 'max_heap_table_size']:
-                if key in cnf_vars:
-                    print(f"      * {key:<25} = {cnf_vars[key]}")
-
-        # Live metrics check via root socket
-        try:
-            res = subprocess.check_output(
-                ['mysql', '-e', "SHOW GLOBAL STATUS WHERE Variable_name IN ('Threads_connected', 'Threads_running', 'Slow_queries', 'Max_used_connections', 'Created_tmp_disk_tables');"],
-                stderr=subprocess.DEVNULL
-            ).decode('utf-8', errors='ignore')
-            
-            lines = res.splitlines()
-            if len(lines) > 1:
-                print("  [+] Live MySQL Metrics:")
-                for line in lines[1:]:
-                    parts = line.split()
-                    if len(parts) == 2:
-                        print(f"      * {parts[0]:<25} = {parts[1]}")
-        except Exception:
-            print("  [!] Direct MySQL socket connection unavailable (skipping live metrics).")
+            pass
 
 class FileAudit:
     @staticmethod
-    def check_malicious_and_recent(hours=1):
-        print(f"\n--- Malware & Suspicious File Audit (Last {hours}h) ---")
-        
-        # 1. Check world-writable / temporary directories
-        temp_dirs = ['/tmp', '/var/tmp', '/dev/shm']
-        suspicious_temp = []
-        for tdir in temp_dirs:
-            if os.path.exists(tdir):
-                try:
-                    for root, _, files in os.walk(tdir):
-                        for f in files:
-                            if f.endswith(('.php', '.sh', '.py', '.pl', '.ico')) or f.startswith('.'):
-                                suspicious_temp.append(os.path.join(root, f))
-                except Exception:
-                    pass
-
-        if suspicious_temp:
-            print(f"  [!] WARNING: Found {len(suspicious_temp)} suspicious file(s) in temporary folders:")
-            for sf in suspicious_temp[:10]:
-                print(f"      * {sf}")
-        else:
-            print("  [+] Clean: No suspicious script files found in /tmp, /var/tmp, or /dev/shm.")
-
-        # 2. Check recently modified PHP files in public_html
-        cutoff = time.time() - (hours * 3600)
-        recent_php = []
+    def check_malware():
+        print("\n--- Web Shell & Malware Audit ---")
         known_shells = ['wso.php', 'alfa.php', 'c99.php', 'r57.php', 'shell.php', 'x.php', '.index.php']
-        flagged_shells = []
-
-        home_dirs = glob.glob('/home/*/public_html') + glob.glob('/var/www/html')
+        found_shells = []
+        
+        home_dirs = glob.glob('/home/*/public_html')
         for hdir in home_dirs:
             try:
                 for root, _, files in os.walk(hdir):
                     for f in files:
-                        full_path = os.path.join(root, f)
                         if f.lower() in known_shells or (f.startswith('.') and f.endswith('.php')):
-                            flagged_shells.append(full_path)
-
-                        if f.endswith('.php'):
-                            try:
-                                mtime = os.path.getmtime(full_path)
-                                if mtime >= cutoff:
-                                    recent_php.append((full_path, datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')))
-                            except Exception:
-                                pass
-                        if len(recent_php) >= 20:
-                            break
-                    if len(recent_php) >= 20:
-                        break
+                            found_shells.append(os.path.join(root, f))
             except Exception:
                 pass
 
-        if flagged_shells:
-            print("\n  [!] CRITICAL: Common Web Shell Filenames Detected:")
-            for sh in flagged_shells[:10]:
+        if found_shells:
+            print(f"  [!] CRITICAL: {len(found_shells)} Web Shell(s) or Hidden PHP Script(s) Identified:")
+            for sh in found_shells[:15]:
                 print(f"      * {sh}")
-
-        if recent_php:
-            print(f"\n  [+] Recently Modified PHP Files in public_html (Last {hours}h):")
-            for fpath, mtime_str in recent_php[:10]:
-                print(f"      * [{mtime_str}] {fpath}")
         else:
-            print(f"  [+] Clean: No .php files modified in public_html in the last {hours}h.")
-
-class TrafficCollector:
-    def __init__(self, time_window_delta, log_paths=None):
-        self.time_window_delta = time_window_delta
-        self.cutoff_time = datetime.now() - time_window_delta
-        if log_paths is None:
-            self.log_paths = (
-                glob.glob('/usr/local/apache/domlogs/*/*') +
-                glob.glob('/var/log/apache2/domlogs/*/*') +
-                glob.glob('/var/log/httpd/*log') +
-                glob.glob('/var/log/apache2/*log')
-            )
-        else:
-            self.log_paths = log_paths
-
-    def parse_log_timestamp(self, ts_str):
-        try:
-            clean_ts = ts_str.split()[0]
-            return datetime.strptime(clean_ts, "%d/%b/%Y:%H:%M:%S")
-        except Exception:
-            return None
-
-    def analyze(self):
-        status_counts = Counter()
-        top_uris = Counter()
-        top_ips = Counter()
-        user_agents = Counter()
-        xmlrpc_hits = Counter()
-        wplogin_hits = Counter()
-        bot_categories = Counter()
-        total_hits = 0
-
-        good_bot_keywords = ['googlebot', 'bingbot', 'yandex', 'duckduckgo', 'baiduspider', 'facebookexternalhit']
-        bad_bot_keywords = ['go-http-client', 'python', 'curl', 'wget', 'scrapy', 'libwww', 'zgrab', 'nikto', 'sqlmap', 'headless', 'jndi', 'java/']
-
-        log_pattern = re.compile(
-            r'^(?P<ip>\S+) \S+ \S+ \[(?P<time>.*?)] "(?:GET|POST|HEAD) (?P<uri>\S+)'
-            r'.*?" (?P<status>\d{3}) \S+ "(?P<ref>.*?)" "(?P<ua>.*?)"'
-        )
-
-        for log_file in set(self.log_paths):
-            if not os.path.isfile(log_file) or log_file.endswith(('.gz', '.tar', '.zip')):
-                continue
-            try:
-                with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
-                    for line in f:
-                        match = log_pattern.match(line)
-                        if match:
-                            raw_time = match.group('time')
-                            dt = self.parse_log_timestamp(raw_time)
-                            
-                            if dt and dt < self.cutoff_time:
-                                continue
-
-                            total_hits += 1
-                            ip = match.group('ip')
-                            uri = match.group('uri')
-                            status = match.group('status')
-                            ua = match.group('ua')
-                            ua_lower = ua.lower()
-
-                            status_counts[status] += 1
-                            top_uris[uri] += 1
-                            top_ips[ip] += 1
-                            user_agents[ua] += 1
-
-                            # Bot Categorization
-                            if any(k in ua_lower for k in good_bot_keywords):
-                                bot_categories['Search Engine Crawlers (Good)'] += 1
-                            elif any(k in ua_lower for k in bad_bot_keywords) or ua in ('-', ''):
-                                bot_categories['Automated Bots / Scripts / Abusive'] += 1
-                            else:
-                                bot_categories['Standard Browser Traffic'] += 1
-
-                            if 'xmlrpc.php' in uri:
-                                xmlrpc_hits[ip] += 1
-                            elif 'wp-login.php' in uri:
-                                wplogin_hits[ip] += 1
-            except Exception:
-                continue
-
-        return {
-            'scanned_files': len(self.log_paths),
-            'total_hits': total_hits,
-            'status_breakdown': dict(status_counts),
-            'top_uris': top_uris.most_common(10),
-            'top_ips': top_ips.most_common(10),
-            'user_agents': user_agents.most_common(5),
-            'bot_categories': dict(bot_categories),
-            'xmlrpc_hits': xmlrpc_hits.most_common(5),
-            'wplogin_hits': wplogin_hits.most_common(5)
-        }
+            print("  [+] Clean: No standard webshell filenames detected in /home/*/public_html.")
 
 def main():
-    parser = argparse.ArgumentParser(description="OCC Emergency Diagnostics Engine")
-    parser.add_argument('--traffic', action='store_true', help="Run traffic analysis")
-    parser.add_argument('--last', type=str, default="1h", help="Time frame filter (e.g. 15m, 1h, 24h)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--last', type=str, default="1h")
     args = parser.parse_args()
 
-    time_delta = parse_time_delta(args.last)
-    hours_int = max(1, int(time_delta.total_seconds() // 3600))
-
     print("========================================================")
-    print("OCC EMERGENCY DIAGNOSTICS ENGINE")
+    print("OCC EMERGENCY DIAGNOSTICS ENGINE (v2.2)")
     print("========================================================")
-    
-    SystemAudit.get_load_and_mem()
+    SystemAudit.run_all()
     DiskAudit.check_disks()
-    MySQLAudit.check_config_and_status()
-    FileAudit.check_malicious_and_recent(hours=hours_int)
-
-    print("\n--- Aggregated RAM Usage by Process ---")
-    for proc, mem_mb in SystemAudit.get_process_ram():
-        if mem_mb >= 1024:
-            print(f"  {proc:<45} {mem_mb / 1024:.2f} GB")
-        else:
-            print(f"  {proc:<45} {mem_mb:.2f} MB")
-
-    if args.traffic:
-        print(f"\n--- Traffic & Bot Analysis (Filtered to Last {args.last}) ---")
-        collector = TrafficCollector(time_window_delta=time_delta)
-        data = collector.analyze()
-        
-        print(f"[+] Scanned Log Files   : {data['scanned_files']}")
-        print(f"[+] Total Hits ({args.last:<4})  : {data['total_hits']}")
-        print(f"[+] Status Breakdown    : {data['status_breakdown']}")
-        
-        print("\n[+] Traffic / Bot Breakdown :")
-        for cat, count in data['bot_categories'].items():
-            pct = (count / data['total_hits'] * 100) if data['total_hits'] else 0
-            print(f"    * {cat:<35} : {count:>7} hits ({pct:.1f}%)")
-
-        print("\n[+] Top Request URIs    :")
-        for uri, count in data['top_uris']:
-            print(f"    * {uri:<50} - {count} hits")
-
-        print("\n[+] Top Client IPs      :")
-        for ip, count in data['top_ips']:
-            print(f"    * {ip:<20} - {count} hits")
-
-        print("\n[+] Top User Agents     :")
-        for ua, count in data['user_agents']:
-            print(f"    * {count:>5} : {ua}")
-
-        if data['xmlrpc_hits']:
-            print("\n[+] Top XMLRPC Attacker IPs :")
-            for ip, count in data['xmlrpc_hits']:
-                print(f"    * {ip:<20} - {count} hits")
-
-        if data['wplogin_hits']:
-            print("\n[+] Top WP-Login Attacker IPs :")
-            for ip, count in data['wplogin_hits']:
-                print(f"    * {ip:<20} - {count} hits")
-
-    print("\n--- SAR Historical Stats ---")
-    sar_q = SystemAudit.get_sar_summary()
-    if sar_q:
-        print(">>> Queue / Load History (sar -q):")
-        print("\n".join(sar_q.splitlines()[-6:]))
+    ApacheAudit.check_scoreboard_and_errors()
+    FileAudit.check_malware()
     print("========================================================")
 
 if __name__ == '__main__':
