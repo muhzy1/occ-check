@@ -15,18 +15,16 @@ from collections import Counter
 
 class SystemCollector:
     def collect(self) -> dict:
-        # Load Average
         load = "N/A"
         try:
             with open("/proc/loadavg", "r") as f:
-                load = f.read().split()[:3]
-                load = " / ".join(load)
+                load = " / ".join(f.read().split()[:3])
         except Exception:
             pass
 
-        # Memory & Swap
-        mem = {}
+        mem_summary, swap_summary = "N/A", "N/A"
         try:
+            mem = {}
             with open("/proc/meminfo", "r") as f:
                 for line in f:
                     parts = line.split(":")
@@ -45,15 +43,12 @@ class SystemCollector:
             mem_summary = f"{used_mb}MB / {total_mb}MB ({used_pct}% used)"
             swap_summary = f"{swap_used}MB / {swap_total}MB used"
         except Exception:
-            mem_summary = "N/A"
-            swap_summary = "N/A"
+            pass
 
-        # OOM Events
         oom_findings = []
         try:
-            raw_output = subprocess.check_output(
-                ["dmesg", "-T"], stderr=subprocess.DEVNULL, text=True
-            )
+            raw = subprocess.check_output(["dmesg", "-T"], stderr=subprocess.DEVNULL)
+            raw_output = raw.decode('utf-8', errors='ignore')
             oom_pattern = re.compile(
                 r'\[(?P<timestamp>[^\]]+)\]\s+Out of memory:\s+Killed process\+(x(?P<pid>\d+))?\s+\((?P<process>[^\)]+)\)\s+total-vm:(?P<vm>\d+)kB,\s+anon-rss:(?P<rss>\d+)kB'
             )
@@ -80,32 +75,32 @@ class SystemCollector:
 
 class ApacheCollector:
     def collect(self) -> dict:
-        status_url = "http://127.0.0.1/server-status?auto"
         status_data = {"available": False, "error": None}
-        try:
-            req = urllib.request.Request(status_url, headers={"User-Agent": "occ-check/1.0"})
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                content = resp.read().decode('utf-8')
-                stats = {}
-                for line in content.splitlines():
-                    if ":" in line:
-                        k, v = line.split(":", 1)
-                        stats[k.strip()] = v.strip()
-                status_data = {
-                    "available": True,
-                    "busy_workers": int(stats.get("BusyWorkers", 0)),
-                    "idle_workers": int(stats.get("IdleWorkers", 0)),
-                    "total_accesses": stats.get("Total Accesses", "N/A"),
-                    "scoreboard": stats.get("Scoreboard", "")
-                }
-        except Exception as e:
-            status_data["error"] = str(e)
+        for url in ["http://127.0.0.1/server-status?auto", "http://127.0.0.1/whm-server-status?auto"]:
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "occ-check/1.0"})
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    content = resp.read().decode('utf-8', errors='ignore')
+                    stats = {}
+                    for line in content.splitlines():
+                        if ":" in line:
+                            k, v = line.split(":", 1)
+                            stats[k.strip()] = v.strip()
+                    status_data = {
+                        "available": True,
+                        "busy_workers": int(stats.get("BusyWorkers", 0)),
+                        "idle_workers": int(stats.get("IdleWorkers", 0)),
+                        "total_accesses": stats.get("Total Accesses", "N/A"),
+                        "scoreboard": stats.get("Scoreboard", "")
+                    }
+                    break
+            except Exception as e:
+                status_data["error"] = str(e)
 
-        # Count Apache processes
         proc_count = 0
         try:
-            out = subprocess.check_output(["pgrep", "-c", "-f", "httpd|apache2"], stderr=subprocess.DEVNULL, text=True)
-            proc_count = int(out.strip())
+            raw = subprocess.check_output(["pgrep", "-f", "httpd|apache2|lshttpd|nginx"], stderr=subprocess.DEVNULL)
+            proc_count = len(raw.decode('utf-8', errors='ignore').strip().splitlines())
         except Exception:
             pass
 
@@ -115,14 +110,13 @@ class PHPCollector:
     def collect(self) -> dict:
         proc_count = 0
         try:
-            out = subprocess.check_output(["pgrep", "-c", "-f", "php-fpm"], stderr=subprocess.DEVNULL, text=True)
-            proc_count = int(out.strip())
+            raw = subprocess.check_output(["pgrep", "-f", "php-fpm|lsphp"], stderr=subprocess.DEVNULL)
+            proc_count = len(raw.decode('utf-8', errors='ignore').strip().splitlines())
         except Exception:
             pass
 
-        # Check for max_children reached in logs
         max_children_alerts = 0
-        php_logs = glob.glob("/var/log/php*-fpm*.log") + glob.glob("/var/log/php-fpm/*.log")
+        php_logs = glob.glob("/var/log/php*-fpm*.log") + glob.glob("/var/log/php-fpm/*.log") + glob.glob("/usr/local/cpanel/logs/error_log")
         for logfile in php_logs:
             try:
                 with open(logfile, 'r', errors='ignore') as f:
@@ -144,15 +138,15 @@ class MySQLCollector:
     def collect(self) -> dict:
         running = False
         try:
-            out = subprocess.check_output(["pgrep", "-f", "mysqld|mariadb"], stderr=subprocess.DEVNULL, text=True)
-            running = bool(out.strip())
+            raw = subprocess.check_output(["pgrep", "-f", "mysqld|mariadb"], stderr=subprocess.DEVNULL)
+            running = bool(raw.decode('utf-8', errors='ignore').strip())
         except Exception:
             running = False
 
         conn_count = 0
         try:
-            out = subprocess.check_output("ss -tan | grep -E ':3306|:33060' | wc -l", shell=True, text=True)
-            conn_count = int(out.strip())
+            raw = subprocess.check_output("ss -tan | grep -E ':3306|:33060' | wc -l", shell=True)
+            conn_count = int(raw.decode('utf-8', errors='ignore').strip())
         except Exception:
             pass
 
@@ -164,7 +158,8 @@ class NetworkCollector:
         top_remote = Counter()
         try:
             cmd = "ss -ntu" if shutil.which("ss") else "netstat -ntu"
-            out = subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.DEVNULL)
+            raw = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL)
+            out = raw.decode('utf-8', errors='ignore')
             lines = out.splitlines()[1:]
             for line in lines:
                 parts = line.split()
@@ -173,7 +168,7 @@ class NetworkCollector:
                     remote = parts[4] if shutil.which("ss") else parts[4]
                     states[state] += 1
                     ip = remote.rsplit(":", 1)[0].strip("[]")
-                    if ip not in ("127.0.0.1", "::1", "0.0.0.0", "*"):
+                    if ip not in ("127.0.0.1", "::1", "0.0.0.0", "*", "Local"):
                         top_remote[ip] += 1
         except Exception as e:
             return {"available": False, "error": str(e)}
@@ -213,9 +208,7 @@ class TrafficCollector:
             return {"available": False, "error": "No access logs found"}
 
         delta = self.parse_window(window_str)
-        ip_counts = Counter()
-        uri_counts = Counter()
-        status_counts = Counter()
+        ip_counts, uri_counts, status_counts = Counter(), Counter(), Counter()
         total_reqs = 0
         latest_dt = None
 
@@ -305,7 +298,6 @@ def main():
     parser.add_argument("--last", type=str, default="15m", help="Time window for traffic (e.g. 15m, 1h)")
     args, _ = parser.parse_known_args()
 
-    # Determine execution mode
     run_all = not (args.apache or args.php or args.mysql or args.network or args.security)
 
     print("========================================================")
@@ -335,7 +327,7 @@ def main():
     if run_all or args.php:
         php = PHPCollector().collect()
         print("\n--- PHP-FPM Diagnostic ---")
-        print(f"[+] PHP-FPM Processes   : {php['proc_count']}")
+        print(f"[+] PHP/FPM Processes   : {php['proc_count']}")
         print(f"[+] Max Children Warnings: {php['max_children_alerts']}")
 
     if run_all or args.mysql:
