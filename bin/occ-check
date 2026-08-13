@@ -6,78 +6,193 @@ import os
 import re
 import sys
 import glob
+import shutil
 import argparse
-import urllib.request
 import subprocess
+import urllib.request
 from datetime import datetime, timedelta
 from collections import Counter
 
-class OOMCollector:
-    OOM_PATTERN = re.compile(
-        r'\[(?P<timestamp>[^\]]+)\]\s+Out of memory:\s+Killed process\+(x(?P<pid>\d+))?\s+\((?P<process>[^\)]+)\)\s+total-vm:(?P<vm>\d+)kB,\s+anon-rss:(?P<rss>\d+)kB'
-    )
-
+class SystemCollector:
     def collect(self) -> dict:
-        findings = []
+        # Load Average
+        load = "N/A"
+        try:
+            with open("/proc/loadavg", "r") as f:
+                load = f.read().split()[:3]
+                load = " / ".join(load)
+        except Exception:
+            pass
+
+        # Memory & Swap
+        mem = {}
+        try:
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    parts = line.split(":")
+                    if len(parts) == 2:
+                        mem[parts[0].strip()] = int(parts[1].split()[0])
+            
+            total_mb = round(mem.get("MemTotal", 0) / 1024, 1)
+            free_mb = round(mem.get("MemAvailable", mem.get("MemFree", 0)) / 1024, 1)
+            used_mb = round(total_mb - free_mb, 1)
+            used_pct = round((used_mb / total_mb) * 100, 1) if total_mb > 0 else 0
+
+            swap_total = round(mem.get("SwapTotal", 0) / 1024, 1)
+            swap_free = round(mem.get("SwapFree", 0) / 1024, 1)
+            swap_used = round(swap_total - swap_free, 1)
+
+            mem_summary = f"{used_mb}MB / {total_mb}MB ({used_pct}% used)"
+            swap_summary = f"{swap_used}MB / {swap_total}MB used"
+        except Exception:
+            mem_summary = "N/A"
+            swap_summary = "N/A"
+
+        # OOM Events
+        oom_findings = []
         try:
             raw_output = subprocess.check_output(
                 ["dmesg", "-T"], stderr=subprocess.DEVNULL, text=True
             )
+            oom_pattern = re.compile(
+                r'\[(?P<timestamp>[^\]]+)\]\s+Out of memory:\s+Killed process\+(x(?P<pid>\d+))?\s+\((?P<process>[^\)]+)\)\s+total-vm:(?P<vm>\d+)kB,\s+anon-rss:(?P<rss>\d+)kB'
+            )
+            for line in raw_output.splitlines():
+                if "out of memory" in line.lower() or "killed process" in line.lower():
+                    match = oom_pattern.search(line)
+                    if match:
+                        data = match.groupdict()
+                        oom_findings.append({
+                            "process": data["process"],
+                            "pid": data["pid"],
+                            "rss_mb": round(int(data["rss"]) / 1024, 2)
+                        })
         except Exception:
-            return {"oom_events": [], "count": 0}
+            pass
 
-        for line in raw_output.splitlines():
-            if "Out of memory" in line or "killed process" in line.lower():
-                match = self.OOM_PATTERN.search(line)
-                if match:
-                    data = match.groupdict()
-                    findings.append({
-                        "process": data["process"],
-                        "pid": data["pid"],
-                        "rss_mb": round(int(data["rss"]) / 1024, 2),
-                        "total_vm_mb": round(int(data["vm"]) / 1024, 2),
-                    })
+        return {
+            "load": load,
+            "memory": mem_summary,
+            "swap": swap_summary,
+            "oom_count": len(oom_findings),
+            "oom_events": oom_findings
+        }
 
-        return {"oom_events": findings, "count": len(findings)}
-
-class ApacheStatusCollector:
-    def collect(self, status_url: str = "http://127.0.0.1/server-status?auto") -> dict:
+class ApacheCollector:
+    def collect(self) -> dict:
+        status_url = "http://127.0.0.1/server-status?auto"
+        status_data = {"available": False, "error": None}
         try:
             req = urllib.request.Request(status_url, headers={"User-Agent": "occ-check/1.0"})
             with urllib.request.urlopen(req, timeout=3) as resp:
                 content = resp.read().decode('utf-8')
+                stats = {}
+                for line in content.splitlines():
+                    if ":" in line:
+                        k, v = line.split(":", 1)
+                        stats[k.strip()] = v.strip()
+                status_data = {
+                    "available": True,
+                    "busy_workers": int(stats.get("BusyWorkers", 0)),
+                    "idle_workers": int(stats.get("IdleWorkers", 0)),
+                    "total_accesses": stats.get("Total Accesses", "N/A"),
+                    "scoreboard": stats.get("Scoreboard", "")
+                }
+        except Exception as e:
+            status_data["error"] = str(e)
+
+        # Count Apache processes
+        proc_count = 0
+        try:
+            out = subprocess.check_output(["pgrep", "-c", "-f", "httpd|apache2"], stderr=subprocess.DEVNULL, text=True)
+            proc_count = int(out.strip())
+        except Exception:
+            pass
+
+        return {"proc_count": proc_count, "status": status_data}
+
+class PHPCollector:
+    def collect(self) -> dict:
+        proc_count = 0
+        try:
+            out = subprocess.check_output(["pgrep", "-c", "-f", "php-fpm"], stderr=subprocess.DEVNULL, text=True)
+            proc_count = int(out.strip())
+        except Exception:
+            pass
+
+        # Check for max_children reached in logs
+        max_children_alerts = 0
+        php_logs = glob.glob("/var/log/php*-fpm*.log") + glob.glob("/var/log/php-fpm/*.log")
+        for logfile in php_logs:
+            try:
+                with open(logfile, 'r', errors='ignore') as f:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    f.seek(max(0, size - 500000))
+                    for line in f:
+                        if "max_children" in line:
+                            max_children_alerts += 1
+            except Exception:
+                pass
+
+        return {
+            "proc_count": proc_count,
+            "max_children_alerts": max_children_alerts
+        }
+
+class MySQLCollector:
+    def collect(self) -> dict:
+        running = False
+        try:
+            out = subprocess.check_output(["pgrep", "-f", "mysqld|mariadb"], stderr=subprocess.DEVNULL, text=True)
+            running = bool(out.strip())
+        except Exception:
+            running = False
+
+        conn_count = 0
+        try:
+            out = subprocess.check_output("ss -tan | grep -E ':3306|:33060' | wc -l", shell=True, text=True)
+            conn_count = int(out.strip())
+        except Exception:
+            pass
+
+        return {"running": running, "active_port_connections": conn_count}
+
+class NetworkCollector:
+    def collect(self) -> dict:
+        states = Counter()
+        top_remote = Counter()
+        try:
+            cmd = "ss -ntu" if shutil.which("ss") else "netstat -ntu"
+            out = subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.DEVNULL)
+            lines = out.splitlines()[1:]
+            for line in lines:
+                parts = line.split()
+                if len(parts) >= 5:
+                    state = parts[0] if shutil.which("ss") else parts[5]
+                    remote = parts[4] if shutil.which("ss") else parts[4]
+                    states[state] += 1
+                    ip = remote.rsplit(":", 1)[0].strip("[]")
+                    if ip not in ("127.0.0.1", "::1", "0.0.0.0", "*"):
+                        top_remote[ip] += 1
         except Exception as e:
             return {"available": False, "error": str(e)}
 
-        stats = {}
-        for line in content.splitlines():
-            if ":" in line:
-                key, val = line.split(":", 1)
-                stats[key.strip()] = val.strip()
-
-        scoreboard = stats.get("Scoreboard", "")
-        busy_workers = int(stats.get("BusyWorkers", 0))
-        idle_workers = int(stats.get("IdleWorkers", 0))
-        total_workers = busy_workers + idle_workers
-        open_slots = scoreboard.count(".")
-
         return {
             "available": True,
-            "busy_workers": busy_workers,
-            "idle_workers": idle_workers,
-            "is_exhausted": (open_slots == 0 and total_workers > 0)
+            "states": dict(states),
+            "top_connections": top_remote.most_common(5)
         }
 
-class AccessLogCollector:
+class TrafficCollector:
     LOG_PATHS = [
-        "/var/log/httpd/access_log",
-        "/var/log/apache2/access.log",
-        "/var/log/nginx/access.log",
-        "/var/log/apache2/other_vhosts_access.log",
-        "/etc/httpd/logs/access_log",
-        "/usr/local/apache/logs/access_log",
+        "/var/log/httpd/access_log", "/var/log/apache2/access.log",
+        "/var/log/nginx/access.log", "/var/log/apache2/other_vhosts_access.log",
+        "/etc/httpd/logs/access_log", "/usr/local/apache/logs/access_log"
     ]
-    LOG_PATTERN = re.compile(r'^(?P<ip>\S+)\s+\S+\s+\S+\s+\[(?P<ts>\d{2}\/[A-Za-z]{3}\/\d{4}:\d{2}:\d{2}:\d{2})')
+    PATTERN = re.compile(
+        r'^(?P<ip>\S+)\s+\S+\s+\S+\s+\[(?P<ts>\d{2}\/[A-Za-z]{3}\/\d{4}:\d{2}:\d{2}:\d{2}).*?\]\s+"(?P<method>\S+)\s+(?P<uri>\S+)\s+HTTP/[^"]+"\s+(?P<status>\d{3})'
+    )
 
     def parse_window(self, window_str: str) -> timedelta:
         unit = window_str[-1].lower() if window_str else 'm'
@@ -85,118 +200,179 @@ class AccessLogCollector:
             num = int(window_str[:-1])
         except ValueError:
             return timedelta(minutes=15)
+        return timedelta(minutes=num) if unit == 'm' else timedelta(hours=num) if unit == 'h' else timedelta(minutes=15)
 
-        if unit == 's':
-            return timedelta(seconds=num)
-        elif unit == 'm':
-            return timedelta(minutes=num)
-        elif unit == 'h':
-            return timedelta(hours=num)
-        elif unit == 'd':
-            return timedelta(days=num)
-        return timedelta(minutes=15)
-
-    def find_log_files(self) -> list:
-        found = [path for path in self.LOG_PATHS if os.path.exists(path)]
-        cpanel_domlogs = glob.glob("/usr/local/apache/domlogs/*")
-        for log in cpanel_domlogs:
+    def collect(self, window_str: str = "15m") -> dict:
+        log_files = [p for p in self.LOG_PATHS if os.path.exists(p)]
+        cpanel_logs = glob.glob("/usr/local/apache/domlogs/*")
+        for log in cpanel_logs:
             if os.path.isfile(log) and not log.endswith(('-bytes', '-ssl_log')):
-                found.append(log)
-        return found
+                log_files.append(log)
 
-    def collect(self, window_str: str = "15m", top_n: int = 10) -> dict:
-        log_files = self.find_log_files()
         if not log_files:
-            return {"available": False, "error": "No accessible access logs found in standard paths"}
+            return {"available": False, "error": "No access logs found"}
 
         delta = self.parse_window(window_str)
         ip_counts = Counter()
-        total_requests = 0
+        uri_counts = Counter()
+        status_counts = Counter()
+        total_reqs = 0
         latest_dt = None
 
-        for filepath in log_files:
+        for path in log_files:
             try:
-                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                with open(path, 'r', errors='ignore') as f:
                     f.seek(0, os.SEEK_END)
                     size = f.tell()
                     f.seek(max(0, size - 2000000))
                     for line in f:
-                        match = self.LOG_PATTERN.match(line)
-                        if match:
+                        m = self.PATTERN.match(line)
+                        if m:
                             try:
-                                dt = datetime.strptime(match.group(2), "%d/%b/%Y:%H:%M:%S")
+                                dt = datetime.strptime(m.group('ts'), "%d/%b/%Y:%H:%M:%S")
                                 if latest_dt is None or dt > latest_dt:
                                     latest_dt = dt
                             except ValueError:
                                 pass
             except Exception:
-                continue
+                pass
 
         if not latest_dt:
             latest_dt = datetime.now()
 
-        cutoff_dt = latest_dt - delta
+        cutoff = latest_dt - delta
 
-        for filepath in log_files:
+        for path in log_files:
             try:
-                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                with open(path, 'r', errors='ignore') as f:
                     f.seek(0, os.SEEK_END)
                     size = f.tell()
                     f.seek(max(0, size - 3000000))
                     for line in f:
-                        match = self.LOG_PATTERN.match(line)
-                        if match:
-                            ip, ts_str = match.groups()
+                        m = self.PATTERN.match(line)
+                        if m:
                             try:
-                                dt = datetime.strptime(ts_str, "%d/%b/%Y:%H:%M:%S")
-                                if dt >= cutoff_dt:
-                                    ip_counts[ip] += 1
-                                    total_requests += 1
+                                dt = datetime.strptime(m.group('ts'), "%d/%b/%Y:%H:%M:%S")
+                                if dt >= cutoff:
+                                    ip_counts[m.group('ip')] += 1
+                                    uri_counts[m.group('uri')] += 1
+                                    status_counts[m.group('status')] += 1
+                                    total_reqs += 1
                             except ValueError:
                                 pass
             except Exception:
-                continue
+                pass
 
         return {
             "available": True,
-            "logs_scanned": len(log_files),
-            "total_requests": total_requests,
-            "top_ips": ip_counts.most_common(top_n)
+            "scanned": len(log_files),
+            "total": total_reqs,
+            "top_ips": ip_counts.most_common(5),
+            "top_uris": uri_counts.most_common(5),
+            "statuses": dict(status_counts)
+        }
+
+class SecurityCollector:
+    def collect(self) -> dict:
+        auth_logs = glob.glob("/var/log/secure*") + glob.glob("/var/log/auth.log*")
+        failed_logins = Counter()
+        for log in auth_logs:
+            try:
+                with open(log, 'r', errors='ignore') as f:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    f.seek(max(0, size - 1000000))
+                    for line in f:
+                        if "Failed password" in line:
+                            ip_match = re.search(r'from\s+(\S+)', line)
+                            if ip_match:
+                                failed_logins[ip_match.group(1)] += 1
+            except Exception:
+                pass
+
+        return {
+            "failed_ssh_ips": failed_logins.most_common(5)
         }
 
 def main():
-    parser = argparse.ArgumentParser(prog="occ-check", description="Server Emergency Diagnostics Tool")
+    parser = argparse.ArgumentParser(prog="occ-check", description="OCC Emergency Diagnostics Engine")
+    parser.add_argument("--apache", action="store_true", help="Apache-only deep dive")
+    parser.add_argument("--php", action="store_true", help="PHP-FPM-only deep dive")
+    parser.add_argument("--mysql", action="store_true", help="MySQL-only deep dive")
+    parser.add_argument("--network", action="store_true", help="Connection-state analysis only")
+    parser.add_argument("--security", action="store_true", help="Security/compromise heuristics only")
     parser.add_argument("--traffic", action="store_true", help="Run traffic analysis")
-    parser.add_argument("--last", type=str, default="15m", help="Time window (e.g. 15m, 1h)")
-    args, unknown = parser.parse_known_args()
+    parser.add_argument("--last", type=str, default="15m", help="Time window for traffic (e.g. 15m, 1h)")
+    args, _ = parser.parse_known_args()
 
-    oom = OOMCollector().collect()
-    apache = ApacheStatusCollector().collect()
-    traffic = AccessLogCollector().collect(window_str=args.last)
+    # Determine execution mode
+    run_all = not (args.apache or args.php or args.mysql or args.network or args.security)
 
     print("========================================================")
     print("OCC EMERGENCY DIAGNOSTICS ENGINE")
     print("========================================================")
-    print(f"[+] Kernel OOM Events Detected: {oom['count']}")
-    for event in oom['oom_events']:
-        print(f"    - Killed PID {event['pid']} ({event['process']}) - Freed {event['rss_mb']} MB")
 
-    print(f"[+] Apache Scoreboard Available: {apache['available']}")
-    if apache['available']:
-        print(f"    - Busy Workers: {apache['busy_workers']}")
-        print(f"    - Exhausted: {apache['is_exhausted']}")
-    else:
-        print(f"    - Error: {apache.get('error')}")
+    if run_all or args.traffic:
+        sys_data = SystemCollector().collect()
+        print(f"[+] System Load Average : {sys_data['load']}")
+        print(f"[+] RAM Usage           : {sys_data['memory']}")
+        print(f"[+] Swap Usage          : {sys_data['swap']}")
+        print(f"[+] Kernel OOM Kills    : {sys_data['oom_count']}")
+        for e in sys_data['oom_events']:
+            print(f"    - Killed PID {e['pid']} ({e['process']}) - Freed {e['rss_mb']} MB")
 
-    print(f"[+] Traffic Analysis (Last {args.last}):")
-    if traffic['available']:
-        print(f"    - Logs Scanned: {traffic['logs_scanned']}")
-        print(f"    - Total Requests in Window: {traffic['total_requests']}")
-        print(f"    - Top IP Addresses:")
-        for ip, count in traffic['top_ips']:
-            print(f"      * {ip:<15} - {count} requests")
-    else:
-        print(f"    - Notice: {traffic.get('error')}")
+    if run_all or args.apache:
+        ap = ApacheCollector().collect()
+        print("\n--- Apache Diagnostic ---")
+        print(f"[+] Active Processes    : {ap['proc_count']}")
+        if ap['status']['available']:
+            print(f"[+] Busy Workers        : {ap['status']['busy_workers']}")
+            print(f"[+] Idle Workers        : {ap['status']['idle_workers']}")
+            print(f"[+] Total Accesses      : {ap['status']['total_accesses']}")
+        else:
+            print(f"[-] Status Page Error   : {ap['status']['error']}")
+
+    if run_all or args.php:
+        php = PHPCollector().collect()
+        print("\n--- PHP-FPM Diagnostic ---")
+        print(f"[+] PHP-FPM Processes   : {php['proc_count']}")
+        print(f"[+] Max Children Warnings: {php['max_children_alerts']}")
+
+    if run_all or args.mysql:
+        my = MySQLCollector().collect()
+        print("\n--- MySQL Diagnostic ---")
+        print(f"[+] Database Running    : {my['running']}")
+        print(f"[+] Connections (3306)  : {my['active_port_connections']}")
+
+    if run_all or args.network:
+        net = NetworkCollector().collect()
+        print("\n--- Network State Analysis ---")
+        if net['available']:
+            print(f"[+] TCP States          : {net['states']}")
+            print(f"[+] Top Remote IPs      : {net['top_connections']}")
+        else:
+            print(f"[-] Network Error       : {net['error']}")
+
+    if run_all or args.traffic:
+        tf = TrafficCollector().collect(window_str=args.last)
+        print(f"\n--- Traffic Analysis (Last {args.last}) ---")
+        if tf['available']:
+            print(f"[+] Scanned Log Files   : {tf['scanned']}")
+            print(f"[+] Total Hits          : {tf['total']}")
+            print(f"[+] Status Breakdown    : {tf['statuses']}")
+            print(f"[+] Top Request URIs    :")
+            for uri, cnt in tf['top_uris']:
+                print(f"    * {uri:<30} - {cnt} hits")
+            print(f"[+] Top Client IPs      :")
+            for ip, cnt in tf['top_ips']:
+                print(f"    * {ip:<18} - {cnt} hits")
+        else:
+            print(f"[-] Traffic Error       : {tf['error']}")
+
+    if run_all or args.security:
+        sec = SecurityCollector().collect()
+        print("\n--- Security Heuristics ---")
+        print(f"[+] Top Failed SSH IPs  : {sec['failed_ssh_ips']}")
 
     print("========================================================")
 
