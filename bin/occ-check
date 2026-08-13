@@ -10,28 +10,28 @@ from datetime import datetime, timedelta
 from collections import Counter, defaultdict
 
 def parse_time_delta(time_str):
-    unit = time_str[-1].lower() if time_str else 'h'
+    unit = time_str[-1].lower() if time_str else "h"
     try:
         val = int(time_str[:-1]) if len(time_str) > 1 else int(time_str)
     except ValueError:
         val = 1
-        unit = 'h'
-    if unit == 's': return timedelta(seconds=val)
-    if unit == 'm': return timedelta(minutes=val)
-    if unit == 'h': return timedelta(hours=val)
-    if unit == 'd': return timedelta(days=val)
+        unit = "h"
+    if unit == "s": return timedelta(seconds=val)
+    if unit == "m": return timedelta(minutes=val)
+    if unit == "h": return timedelta(hours=val)
+    if unit == "d": return timedelta(days=val)
     return timedelta(hours=1)
 
 class SystemAudit:
     @staticmethod
     def run_all():
-        load = os.getloadavg() if hasattr(os, 'getloadavg') else (0, 0, 0)
+        load = os.getloadavg() if hasattr(os, "getloadavg") else (0, 0, 0)
         print(f"[+] System Load Average : {load[0]:.2f} / {load[1]:.2f} / {load[2]:.2f}")
         try:
-            with open('/proc/meminfo', 'r') as f:
-                mem = {line.split(':')[0].strip(): int(line.split(':')[1].split()[0]) for line in f if ':' in line}
-            total_mb = mem.get('MemTotal', 0) / 1024
-            free_mb = mem.get('MemAvailable', mem.get('MemFree', 0)) / 1024
+            with open("/proc/meminfo", "r") as f:
+                mem = {line.split(":")[0].strip(): int(line.split(":")[1].split()[0]) for line in f if ":" in line}
+            total_mb = mem.get("MemTotal", 0) / 1024
+            free_mb = mem.get("MemAvailable", mem.get("MemFree", 0)) / 1024
             used_mb = total_mb - free_mb
             pct = (used_mb / total_mb * 100) if total_mb else 0
             print(f"[+] RAM Usage            : {used_mb:.1f}MB / {total_mb:.1f}MB ({pct:.1f}% used)")
@@ -42,11 +42,11 @@ class ApacheAudit:
     @staticmethod
     def check_scoreboard_and_errors():
         print("\n--- Apache Configuration & Error Audit ---")
-        err_log = '/usr/local/apache/logs/error_log'
+        err_log = "/usr/local/apache/logs/error_log"
         if os.path.exists(err_log):
             try:
-                out = subprocess.check_output(['tail', '-n', '500', err_log], stderr=subprocess.DEVNULL).decode('utf-8', errors='ignore')
-                sb_errors = [l for l in out.splitlines() if 'AH03490' in l or 'scoreboard is full' in l]
+                out = subprocess.check_output(["tail", "-n", "500", err_log], stderr=subprocess.DEVNULL).decode("utf-8", errors="ignore")
+                sb_errors = [l for l in out.splitlines() if "AH03490" in l or "scoreboard is full" in l]
                 if sb_errors:
                     print(f"  [!] CRITICAL: Scoreboard full errors detected in Apache error log ({len(sb_errors)} recent hits)!")
                     print("      -> Action Required: Increase ServerLimit in /etc/apache2/conf.d/includes/pre_virtualhost_global.conf")
@@ -59,7 +59,7 @@ class TrafficAudit:
     @staticmethod
     def analyze_traffic(last_str):
         print(f"\n--- Traffic Analysis (Window: {last_str}) ---")
-        log_paths = glob.glob('/usr/local/apache/domlogs/*/*') + glob.glob('/var/log/apache2/access_log*')
+        log_paths = glob.glob("/usr/local/apache/domlogs/*/*") + glob.glob("/var/log/apache2/access_log*")
         if not log_paths:
             print("  [*] No access logs found for traffic analysis.")
             return
@@ -67,11 +67,10 @@ class TrafficAudit:
         ip_counter = Counter()
         uri_counter = Counter()
 
-        # Quick inspect tail of dominant active logs
         for lpath in log_paths[:20]:
-            if os.path.isfile(lpath) and not lpath.endswith('.gz'):
+            if os.path.isfile(lpath) and not lpath.endswith(".gz"):
                 try:
-                    out = subprocess.check_output(['tail', '-n', '1000', lpath], stderr=subprocess.DEVNULL).decode('utf-8', errors='ignore')
+                    out = subprocess.check_output(["tail", "-n", "1000", lpath], stderr=subprocess.DEVNULL).decode("utf-8", errors="ignore")
                     for line in out.splitlines():
                         parts = line.split()
                         if len(parts) > 6:
@@ -86,7 +85,7 @@ class TrafficAudit:
                 print(f"    * {ip:<18} : {count} requests")
             print("  Top Requested Endpoints:")
             for uri, count in uri_counter.most_common(5):
-                print(f"    * {uri[:50]:<50} : {count} requests")
+                print(f"    * {uri[:100]:<100} : {count} requests")
         else:
             print("  [*] No active traffic logged in recent windows.")
 
@@ -95,11 +94,11 @@ class DiskAudit:
     def check_disks():
         print("\n--- Storage & Partition Health ---")
         try:
-            df_out = subprocess.check_output(['df', '-hP'], stderr=subprocess.DEVNULL).decode('utf-8', errors='ignore')
+            df_out = subprocess.check_output(["df", "-hP"], stderr=subprocess.DEVNULL).decode("utf-8", errors="ignore")
             for line in df_out.splitlines()[1:]:
                 parts = line.split()
                 if len(parts) >= 6:
-                    mount, pct_str = parts[5], parts[4].replace('%', '')
+                    mount, pct_str = parts[5], parts[4].replace("%", "")
                     if pct_str.isdigit():
                         pct = int(pct_str)
                         flag = " [CRITICAL]" if pct >= 90 else (" [WARNING]" if pct >= 80 else "")
@@ -111,15 +110,15 @@ class FileAudit:
     @staticmethod
     def check_malware():
         print("\n--- Web Shell & Malware Audit ---")
-        known_shells = ['wso.php', 'alfa.php', 'c99.php', 'r57.php', 'shell.php', 'x.php', '.index.php']
+        known_shells = ["wso.php", "alfa.php", "c99.php", "r57.php", "shell.php", "x.php", ".index.php"]
         found_shells = []
         
-        home_dirs = glob.glob('/home/*/public_html')
+        home_dirs = glob.glob("/home/*/public_html")
         for hdir in home_dirs:
             try:
                 for root, _, files in os.walk(hdir):
                     for f in files:
-                        if f.lower() in known_shells or (f.startswith('.') and f.endswith('.php')):
+                        if f.lower() in known_shells or (f.startswith(".") and f.endswith(".php")):
                             found_shells.append(os.path.join(root, f))
             except Exception:
                 pass
@@ -133,8 +132,8 @@ class FileAudit:
 
 def main():
     parser = argparse.ArgumentParser(description="OCC Emergency Diagnostics Engine")
-    parser.add_argument('--last', type=str, default="1h", help="Time window (e.g. 10m, 1h, 1d)")
-    parser.add_argument('--traffic', action='store_true', help="Enable HTTP traffic breakdown")
+    parser.add_argument("--last", type=str, default="1h", help="Time window (e.g. 10m, 1h, 1d)")
+    parser.add_argument("--traffic", action="store_true", help="Enable HTTP traffic breakdown")
     args = parser.parse_args()
 
     print("========================================================")
@@ -150,5 +149,5 @@ def main():
     FileAudit.check_malware()
     print("========================================================")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
