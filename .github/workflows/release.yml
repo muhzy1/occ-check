@@ -1,0 +1,31 @@
+name: Build and Release Standalone Binary
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Build ZipApp Bundle
+        run: python build/bundle.py
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/occ-check.pyz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

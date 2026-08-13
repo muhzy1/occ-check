@@ -1,32 +1,26 @@
 #!/usr/bin/env python3
 import os
-import zipapp
 import shutil
+import zipapp
 
-def build_artifact():
-    build_dir = "/tmp/occ_build"
-    output_file = "dist/occ-check"
-
-    if os.path.exists(build_dir):
-        shutil.rmtree(build_dir)
-    os.makedirs("dist", exist_ok=True)
-    os.makedirs(build_dir)
-
-    shutil.copytree("occ_check", os.path.join(build_dir, "occ_check"))
+def build():
+    dist_dir = "dist"
+    target_pyz = os.path.join(dist_dir, "occ-check.pyz")
     
-    with open(os.path.join(build_dir, "__main__.py"), "w") as f:
-        f.write("import sys\n")
-        f.write("from occ_check.cli import main\n")
-        f.write("if __name__ == '__main__':\n")
-        f.write("    main()\n")
+    if os.path.exists(dist_dir):
+        shutil.rmtree(dist_dir)
+    os.makedirs(dist_dir)
 
+    print("Building dist/occ-check.pyz...")
     zipapp.create_archive(
-        build_dir,
-        target=output_file,
-        interpreter="/usr/bin/env python3"
+        source="lib/occ",
+        target=target_pyz,
+        interpreter="/usr/bin/env python3",
+        main="cli:main"
     )
-    os.chmod(output_file, 0o755)
-    print("[SUCCESS] Compiled single-file artifact created at: {}".format(output_file))
+    
+    os.chmod(target_pyz, 0o755)
+    print(f"Bundle built successfully: {target_pyz}")
 
 if __name__ == "__main__":
-    build_artifact()
+    build()
