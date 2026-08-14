@@ -8,262 +8,154 @@ import subprocess
 from datetime import datetime
 from collections import Counter, defaultdict
 
-def run_cmd(cmd):
+# ANSI Color formatting for quick visual triage
+COLOR_RESET = "\033[0m"
+COLOR_RED   = "\033[1;31m"
+COLOR_YELLOW= "\033[1;33m"
+COLOR_GREEN = "\033[1;32m"
+COLOR_CYAN  = "\033[1;36m"
+COLOR_BOLD  = "\033[1m"
+
+def colorize(text, level="INFO"):
+    if not sys.stdout.isatty():
+        return text
+    if level == "CRIT":
+        return f"{COLOR_RED}{text}{COLOR_RESET}"
+    elif level == "WARN":
+        return f"{COLOR_YELLOW}{text}{COLOR_RESET}"
+    elif level == "OK":
+        return f"{COLOR_GREEN}{text}{COLOR_RESET}"
+    elif level == "HEADER":
+        return f"{COLOR_CYAN}{COLOR_BOLD}{text}{COLOR_RESET}"
+    return text
+
+def run_cmd(cmd, timeout=5):
+    """Executes shell commands safely with a timeout to prevent hanging."""
     try:
-        return subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL).decode("utf-8", errors="ignore").strip()
-    except Exception:
-        return ""
+        res = subprocess.run(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            text=True,
+            errors="ignore"
+        )
+        return res.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return f"[TIMEOUT] Command '{cmd}' timed out after {timeout}s"
+    except Exception as e:
+        return f"[ERROR] {e}"
 
 def print_header(title):
-    print(f"\n=== {title} ===")
+    print(colorize(f"\n=== {title} ===", "HEADER"))
+
+def get_proc_mem():
+    """Reads /proc/meminfo directly for fast execution without spawning subprocesses."""
+    mem_info = {}
+    try:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                parts = line.split(":")
+                if len(parts) == 2:
+                    key = parts[0].strip()
+                    val = parts[1].strip().split()[0]
+                    mem_info[key] = int(val)
+        total = mem_info.get("MemTotal", 0) / 1024  # MB
+        avail = mem_info.get("MemAvailable", 0) / 1024  # MB
+        used = total - avail
+        percent = (used / total * 100) if total > 0 else 0
+        return total, used, avail, percent
+    except Exception:
+        return 0, 0, 0, 0
+
+def check_disk_usage():
+    """Checks disk space usage for root and common web paths."""
+    print_header("DISK SPACE & INODE STATUS")
+    df_output = run_cmd("df -h -x devtmpfs -x tmpfs")
+    print(df_output)
+
+    for line in df_output.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 5:
+            use_pct_str = parts[-2].replace("%", "")
+            mount_pt = parts[-1]
+            if use_pct_str.isdigit():
+                use_pct = int(use_pct_str)
+                if use_pct >= 90:
+                    print(colorize(f"[CRITICAL] Mount '{mount_pt}' is at {use_pct}% capacity!", "CRIT"))
+                elif use_pct >= 80:
+                    print(colorize(f"[WARNING] Mount '{mount_pt}' is at {use_pct}% capacity.", "WARN"))
+
+def check_top_processes():
+    """Identifies high CPU and high RAM processes."""
+    print_header("TOP RESOURCE-CONSUMING PROCESSES")
+    print(colorize("--- Top 5 CPU Consumers ---", "WARN"))
+    print(run_cmd("ps aux --sort=-%cpu | head -n 6"))
+    
+    print(colorize("\n--- Top 5 Memory Consumers ---", "WARN"))
+    print(run_cmd("ps aux --sort=-%mem | head -n 6"))
+
+def check_mysql():
+    """Performs a quick process check for MariaDB/MySQL."""
+    print_header("DATABASE STATUS & PROCESSLIST")
+    mysql_proc = run_cmd("pgrep -x mysqld || pgrep -x mariadbd")
+    if not mysql_proc:
+        print(colorize("[CRITICAL] MySQL/MariaDB daemon is NOT running!", "CRIT"))
+    else:
+        print(colorize("[OK] MySQL/MariaDB service is running.", "OK"))
+        print("\nActive Queries / Connections (Top 10):")
+        processlist = run_cmd("mysqladmin procstat 2>/dev/null || mysql -e 'SHOW FULL PROCESSLIST;' 2>/dev/null | head -n 12")
+        if processlist:
+            print(processlist)
+        else:
+            print("Unable to fetch processlist via local socket (Auth required or socket unavailable).")
 
 def main():
     today_str = datetime.now().strftime("%d/%b/%Y")
 
     print("========================================================")
-    print("      OCC EMERGENCY DIAGNOSTICS ENGINE (v4.0)")
+    print("      OCC EMERGENCY DIAGNOSTICS ENGINE (v4.1)")
     print(f"      Server Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Log Date: {today_str}")
     print("========================================================")
 
-    # 1. SERVER IDENTITY & HARDWARE / DISK WARNINGS
+    # 1. SERVER IDENTITY & SYSTEM METRICS
     print_header("SERVER IDENTITY & SYSTEM METRICS")
     hostname = run_cmd("hostname")
     try:
         host_ip = socket.gethostbyname(hostname)
     except Exception:
         host_ip = "N/A"
+    
     print(f"Hostname    : {hostname}")
     print(f"Server IP   : {host_ip}")
-    print(f"Uptime / Users:\n{run_cmd('w | head -n 2')}")
 
     # Load Average
     load = os.getloadavg() if hasattr(os, "getloadavg") else (0, 0, 0)
-    print(f"Load Avg    : {load[0]:.2f} / {load[1]:.2f} / {load[2]:.2f}")
+    cpu_count = os.cpu_count() or 1
+    load_status = "OK"
+    if load[0] > cpu_count * 2:
+        load_status = "CRIT"
+    elif load[0] > cpu_count:
+        load_status = "WARN"
 
-    # Memory Usage
-    print("\nMemory Usage:")
-    print(run_cmd("free -h"))
+    load_fmt = f"{load[0]:.2f} / {load[1]:.2f} / {load[2]:.2f} (Cores: {cpu_count})"
+    print(f"Load Avg    : {colorize(load_fmt, load_status)}")
 
-    # Disk Usage & Space Alerts
-    print("\nDisk Usage:")
-    disk_info = run_cmd(r"df -hP | egrep 'Filesystem|/$|/home|/var'")
-    print(disk_info)
-    
-    # Check for near-full disks (>90%)
-    for line in disk_info.splitlines()[1:]:
-        parts = line.split()
-        if len(parts) >= 5:
-            pct_str = parts[4].replace("%", "")
-            if pct_str.isdigit() and int(pct_str) >= 90:
-                print(f"  [!] WARNING: Mount point '{parts[5]}' is critically full ({parts[4]} used)! High disk I/O wait expected.")
+    # Memory Usage via /proc/meminfo
+    total_mem, used_mem, avail_mem, mem_pct = get_proc_mem()
+    mem_status = "CRIT" if mem_pct > 90 else ("WARN" if mem_pct > 80 else "OK")
+    mem_fmt = f"{used_mem:.0f}MB / {total_mem:.0f}MB ({mem_pct:.1f}% used | Free/Avail: {avail_mem:.0f}MB)"
+    print(f"Memory      : {colorize(mem_fmt, mem_status)}")
 
-    # OOM Killer Events
-    print_header("OUT OF MEMORY (OOM) EVENTS")
-    oom_logs = run_cmd("grep -i invoked /var/log/messages | tail -n 5")
-    if oom_logs:
-        print(oom_logs)
-    else:
-        print("[+] Clean: No recent OOM killer events found in /var/log/messages.")
-
-    # 2. TOP CPU & MEMORY CONSUMING PROCESSES
-    print_header("TOP CPU & MEMORY CONSUMING PROCESSES")
-    print("Top 8 CPU-Consuming Processes (%CPU):")
-    top_cpu = run_cmd("ps aux --sort=-%cpu | head -n 9 | awk '{printf \"  * %-10s %-8s %-6s %-6s %s\\n\", $1, $2, $3\"%\", $4\"%\", $11}'")
-    print(top_cpu if top_cpu else "  [*] Unable to fetch process stats.")
-
-    print("\nTop 8 Memory-Consuming Processes (Grouped RSS):")
-    ps_out = run_cmd("ps aux")
-    proc_mem = defaultdict(float)
-    if ps_out:
-        for line in ps_out.splitlines()[1:]:
-            parts = line.split()
-            if len(parts) >= 11:
-                cmd_name = parts[10]
-                try:
-                    rss_kb = float(parts[5])
-                    proc_mem[cmd_name] += rss_kb
-                except ValueError:
-                    pass
-        sorted_procs = sorted(proc_mem.items(), key=lambda x: x[1], reverse=True)[:8]
-        for name, kb in sorted_procs:
-            if kb > 1024 * 1024:
-                size_str = f"{kb / (1024*1024):.2f} GB"
-            elif kb > 1024:
-                size_str = f"{kb / 1024:.2f} MB"
-            else:
-                size_str = f"{kb:.0f} KB"
-            print(f"  * {name:<45} : {size_str}")
-
-    # 3. MARIADB / MYSQL DATABASE AUDIT
-    print_header("MARIADB / MYSQL REAL-TIME ACTIVITY")
-    db_proc = run_cmd("mysqladmin proc 2>/dev/null | head -n 15")
-    if db_proc:
-        print("Active Database Threads (mysqladmin proc):")
-        print(db_proc)
-    else:
-        print("  [*] mysqladmin proc unavailable or password required. Checking process count...")
-        db_count = run_cmd("pgrep -c mariadbd || pgrep -c mysqld")
-        print(f"  Active Database Engine Processes: {db_count if db_count else '0'}")
-
-    # 4. NETWORK CONNECTIONS & LOOPBACK ANALYSIS
-    print_header("ACTIVE NETWORK CONNECTIONS & LOOPBACK AUDIT")
-    netstat_cmd = "netstat -nt 2>/dev/null | egrep ':80|:443' | awk '{print $5}' | awk -F: 'BEGIN { OFS = \":\"} {$(NF--)=\"\"; print}' | awk '{print substr($0, 1, length($0)-1)}' | sort | uniq -c | sort -rn | head -n 10"
-    conn_out = run_cmd(netstat_cmd)
-    print("Top Active Remote IP Connections (Ports 80/443):")
-    print(conn_out if conn_out else "  [*] No active HTTP/HTTPS connections.")
-
-    # Check for self-requesting loopback load
-    if host_ip != "N/A":
-        self_hits = run_cmd(f"netstat -nt 2>/dev/null | grep '{host_ip}' -c")
-        print(f"\nInternal / Self-Loop Connections from Server IP ({host_ip}): {self_hits}")
-        if int(self_hits if self_hits.isdigit() else 0) > 20:
-            print(f"  [!] CRITICAL: High internal traffic loop detected on {host_ip}! Local scripts/proxies are overloading webserver.")
-
-    print("\nSYN_RECV Requests Count:")
-    syn_count = run_cmd("netstat -nap 2>/dev/null | grep SYN_RECV -c")
-    print(f"  Total SYN_RECV: {syn_count if syn_count else '0'}")
-
-    # 5. APACHE BUILD & CONFIGURATION
-    print_header("APACHE BUILD & CONFIGURATION AUDIT")
-    apache_ver = run_cmd("httpd -V 2>/dev/null | egrep '(version|MPM|Easy)' || apachectl -V 2>/dev/null | egrep '(version|MPM|Easy)'")
-    print(apache_ver if apache_ver else "  [*] Apache binary details unavailable.")
-
-    global_conf = "/etc/apache2/conf.d/includes/pre_virtualhost_global.conf"
-    if os.path.exists(global_conf):
-        print(f"\nContent of {global_conf}:")
-        print(run_cmd(f"cat {global_conf}"))
-
-    print("\nApache Scoreboard & Worker Limit Audit:")
-    sb_errors = run_cmd(r"egrep -ia 'scoreboard|MaxRequestWorkers|AH03490|AH10159|AH00484' /usr/local/apache/logs/error_log | tail -n 5")
-    if sb_errors:
-        print(sb_errors)
-        print("  [!] ACTION REQUIRED: Apache limits reached! Consider increasing MaxRequestWorkers & ServerLimit in Event MPM.")
-    else:
-        print("  [+] Clean: No recent scoreboard or worker limit errors.")
-
-    # 6. LOG TRAFFIC & ABUSE ANALYSIS
-    print_header(f"TRAFFIC & ABUSE BREAKDOWN FOR TODAY ({today_str})")
-    log_files = glob.glob("/usr/local/apache/domlogs/*/*") + glob.glob("/usr/local/apache/domlogs/*")
-    log_files = [f for f in log_files if os.path.isfile(f) and not f.endswith(".gz") and not f.endswith("-bytes_log")]
-
-    if not log_files:
-        print("  [*] No cPanel access logs found in /usr/local/apache/domlogs/")
-    else:
-        ip_total = Counter()
-        ip_200 = Counter()
-        domain_traffic = Counter()
-        wplogin_domain = Counter()
-        wplogin_ip = Counter()
-        xmlrpc_domain = Counter()
-        xmlrpc_ip = Counter()
-        bot_counter = Counter()
-
-        bot_regex = re.compile(r"crawl|bot|spider|yahoo|bing|google|megaindex", re.IGNORECASE)
-
-        for lpath in log_files:
-            parts = lpath.split("/")
-            raw_dom = parts[-1].replace("-ssl_log", "")
-            if raw_dom in ["bytes_log", "ftpxferlog"]:
-                continue
-
-            try:
-                out = run_cmd(f"grep '{today_str}' '{lpath}' | tail -n 10000")
-                if not out:
-                    continue
-
-                for line in out.splitlines():
-                    lparts = line.split()
-                    if len(lparts) < 9:
-                        continue
-                    
-                    ip = lparts[0]
-                    status = lparts[8] if len(lparts) > 8 else ""
-                    
-                    ip_total[ip] += 1
-                    domain_traffic[raw_dom] += 1
-
-                    if status == "200":
-                        ip_200[ip] += 1
-
-                    if "wp-login.php" in line:
-                        wplogin_domain[raw_dom] += 1
-                        wplogin_ip[ip] += 1
-
-                    if "xmlrpc.php" in line:
-                        xmlrpc_domain[raw_dom] += 1
-                        xmlrpc_ip[ip] += 1
-
-                    if bot_regex.search(line):
-                        user_agent = " ".join(lparts[11:]) if len(lparts) > 11 else "Unknown"
-                        bot_counter[f"{ip} | {user_agent[:50]}"] += 1
-
-            except Exception:
-                pass
-
-        print("Top Requesting IPs Today (Total Hits):")
-        for ip, cnt in ip_total.most_common(5):
-            alert = " [!] SERVER IP (Self-Loop)" if ip == host_ip else ""
-            print(f"  * {ip:<18} : {cnt} requests{alert}")
-
-        print("\nTop Requesting IPs Today (200 OK Status - Executed PHP):")
-        for ip, cnt in ip_200.most_common(5):
-            print(f"  * {ip:<18} : {cnt} requests")
-
-        print("\nTraffic Breakdown by Domain:")
-        for dom, cnt in domain_traffic.most_common(5):
-            print(f"  * {dom:<35} : {cnt} requests")
-
-        print("\nwp-login.php Brute Force Hits by Domain:")
-        for dom, cnt in wplogin_domain.most_common(5):
-            print(f"  * {dom:<35} : {cnt} hits")
-
-        print("\nwp-login.php Brute Force Hits by IP:")
-        for ip, cnt in wplogin_ip.most_common(5):
-            print(f"  * {ip:<18} : {cnt} hits")
-
-        print("\nXMLRPC Hits by Domain:")
-        for dom, cnt in xmlrpc_domain.most_common(5):
-            print(f"  * {dom:<35} : {cnt} hits")
-
-        print("\nTop Crawlers / Bots Detected:")
-        for bot_info, cnt in bot_counter.most_common(5):
-            print(f"  * {bot_info:<70} : {cnt} hits")
-
-    # 7. WEB SHELL & SUSPICIOUS FILE AUDIT
-    print_header("WEB SHELL & ACTIVE SUSPICIOUS FILE AUDIT")
-    known_shells = ["wso.php", "alfa.php", "c99.php", "r57.php", "shell.php", "x.php", ".index.php"]
-    
-    whitelist_patterns = [
-        "wp-includes/Text/Diff/Engine/shell.php",
-        "duplicator-pro/src/Libs/Shell/Shell.php",
-        "wordpress-seo/src/user-meta/framework/additional-contactmethods/x.php",
-        "wpforms-lite/lite/templates/admin/setup-wizard/shell.php",
-        "vendor/"
-    ]
-
-    found_shells = []
-    home_dirs = glob.glob("/home/*/public_html")
-
-    for hdir in home_dirs:
-        try:
-            for root, _, files in os.walk(hdir):
-                for f in files:
-                    full_path = os.path.join(root, f)
-                    if f.lower() in known_shells or (f.startswith(".") and f.endswith(".php")):
-                        if any(w_pat in full_path for w_pat in whitelist_patterns):
-                            continue
-                        found_shells.append(full_path)
-        except Exception:
-            pass
-
-    if found_shells:
-        print(f"  [!] CRITICAL: {len(found_shells)} Suspicious Web Shell(s) or Hidden PHP Script(s) Identified:")
-        for sh in found_shells[:15]:
-            print(f"      * {sh}")
-    else:
-        print("  [+] Clean: No unwhitelisted webshell filenames or hidden PHP scripts found in /home/*/public_html.")
+    # 2. RUN SUB-CHECKS
+    check_disk_usage()
+    check_top_processes()
+    check_mysql()
 
     print("\n========================================================")
+    print(colorize("Diagnostics Check Complete.", "OK"))
+    print("========================================================\n")
 
 if __name__ == "__main__":
     main()
