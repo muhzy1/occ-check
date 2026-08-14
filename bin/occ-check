@@ -3,151 +3,236 @@ import sys
 import os
 import re
 import glob
-import time
-import argparse
+import socket
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import Counter, defaultdict
 
-def parse_time_delta(time_str):
-    unit = time_str[-1].lower() if time_str else "h"
+def run_cmd(cmd):
     try:
-        val = int(time_str[:-1]) if len(time_str) > 1 else int(time_str)
-    except ValueError:
-        val = 1
-        unit = "h"
-    if unit == "s": return timedelta(seconds=val)
-    if unit == "m": return timedelta(minutes=val)
-    if unit == "h": return timedelta(hours=val)
-    if unit == "d": return timedelta(days=val)
-    return timedelta(hours=1)
+        return subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL).decode("utf-8", errors="ignore").strip()
+    except Exception:
+        return ""
 
-class SystemAudit:
-    @staticmethod
-    def run_all():
-        load = os.getloadavg() if hasattr(os, "getloadavg") else (0, 0, 0)
-        print(f"[+] System Load Average : {load[0]:.2f} / {load[1]:.2f} / {load[2]:.2f}")
-        try:
-            with open("/proc/meminfo", "r") as f:
-                mem = {line.split(":")[0].strip(): int(line.split(":")[1].split()[0]) for line in f if ":" in line}
-            total_mb = mem.get("MemTotal", 0) / 1024
-            free_mb = mem.get("MemAvailable", mem.get("MemFree", 0)) / 1024
-            used_mb = total_mb - free_mb
-            pct = (used_mb / total_mb * 100) if total_mb else 0
-            print(f"[+] RAM Usage            : {used_mb:.1f}MB / {total_mb:.1f}MB ({pct:.1f}% used)")
-        except Exception:
-            pass
-
-class ApacheAudit:
-    @staticmethod
-    def check_scoreboard_and_errors():
-        print("\n--- Apache Configuration & Error Audit ---")
-        err_log = "/usr/local/apache/logs/error_log"
-        if os.path.exists(err_log):
-            try:
-                out = subprocess.check_output(["tail", "-n", "500", err_log], stderr=subprocess.DEVNULL).decode("utf-8", errors="ignore")
-                sb_errors = [l for l in out.splitlines() if "AH03490" in l or "scoreboard is full" in l]
-                if sb_errors:
-                    print(f"  [!] CRITICAL: Scoreboard full errors detected in Apache error log ({len(sb_errors)} recent hits)!")
-                    print("      -> Action Required: Increase ServerLimit in /etc/apache2/conf.d/includes/pre_virtualhost_global.conf")
-                else:
-                    print("  [+] Clean: No recent scoreboard full errors in Apache logs.")
-            except Exception:
-                pass
-
-class TrafficAudit:
-    @staticmethod
-    def analyze_traffic(last_str):
-        print(f"\n--- Traffic Analysis (Window: {last_str}) ---")
-        log_paths = glob.glob("/usr/local/apache/domlogs/*/*") + glob.glob("/var/log/apache2/access_log*")
-        if not log_paths:
-            print("  [*] No access logs found for traffic analysis.")
-            return
-
-        ip_counter = Counter()
-        uri_counter = Counter()
-
-        for lpath in log_paths[:20]:
-            if os.path.isfile(lpath) and not lpath.endswith(".gz"):
-                try:
-                    out = subprocess.check_output(["tail", "-n", "1000", lpath], stderr=subprocess.DEVNULL).decode("utf-8", errors="ignore")
-                    for line in out.splitlines():
-                        parts = line.split()
-                        if len(parts) > 6:
-                            ip_counter[parts[0]] += 1
-                            uri_counter[parts[6]] += 1
-                except Exception:
-                    pass
-
-        if ip_counter:
-            print("  Top Requesting IPs:")
-            for ip, count in ip_counter.most_common(5):
-                print(f"    * {ip:<18} : {count} requests")
-            print("  Top Requested Endpoints:")
-            for uri, count in uri_counter.most_common(5):
-                print(f"    * {uri[:100]:<100} : {count} requests")
-        else:
-            print("  [*] No active traffic logged in recent windows.")
-
-class DiskAudit:
-    @staticmethod
-    def check_disks():
-        print("\n--- Storage & Partition Health ---")
-        try:
-            df_out = subprocess.check_output(["df", "-hP"], stderr=subprocess.DEVNULL).decode("utf-8", errors="ignore")
-            for line in df_out.splitlines()[1:]:
-                parts = line.split()
-                if len(parts) >= 6:
-                    mount, pct_str = parts[5], parts[4].replace("%", "")
-                    if pct_str.isdigit():
-                        pct = int(pct_str)
-                        flag = " [CRITICAL]" if pct >= 90 else (" [WARNING]" if pct >= 80 else "")
-                        print(f"  * {mount:<15} : {parts[2]} used / {parts[1]} total ({parts[4]} used){flag}")
-        except Exception:
-            pass
-
-class FileAudit:
-    @staticmethod
-    def check_malware():
-        print("\n--- Web Shell & Malware Audit ---")
-        known_shells = ["wso.php", "alfa.php", "c99.php", "r57.php", "shell.php", "x.php", ".index.php"]
-        found_shells = []
-        
-        home_dirs = glob.glob("/home/*/public_html")
-        for hdir in home_dirs:
-            try:
-                for root, _, files in os.walk(hdir):
-                    for f in files:
-                        if f.lower() in known_shells or (f.startswith(".") and f.endswith(".php")):
-                            found_shells.append(os.path.join(root, f))
-            except Exception:
-                pass
-
-        if found_shells:
-            print(f"  [!] CRITICAL: {len(found_shells)} Web Shell(s) or Hidden PHP Script(s) Identified:")
-            for sh in found_shells[:15]:
-                print(f"      * {sh}")
-        else:
-            print("  [+] Clean: No standard webshell filenames detected in /home/*/public_html.")
+def print_header(title):
+    print(f"\n=== {title} ===")
 
 def main():
-    parser = argparse.ArgumentParser(description="OCC Emergency Diagnostics Engine")
-    parser.add_argument("--last", type=str, default="1h", help="Time window (e.g. 10m, 1h, 1d)")
-    parser.add_argument("--traffic", action="store_true", help="Enable HTTP traffic breakdown")
-    args = parser.parse_args()
+    today_str = datetime.now().strftime("%d/%b/%Y")
 
     print("========================================================")
-    print("OCC EMERGENCY DIAGNOSTICS ENGINE (v2.3)")
+    print("      OCC EMERGENCY DIAGNOSTICS ENGINE (v3.0)")
+    print(f"      Server Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Log Date: {today_str}")
     print("========================================================")
-    SystemAudit.run_all()
-    DiskAudit.check_disks()
-    ApacheAudit.check_scoreboard_and_errors()
+
+    # 1. SERVER INFORMATION & HARDWARE METRICS
+    print_header("SERVER IDENTITY & SYSTEM METRICS")
+    hostname = run_cmd("hostname")
+    try:
+        host_ip = socket.gethostbyname(hostname)
+    except Exception:
+        host_ip = "N/A"
+    print(f"Hostname    : {hostname}")
+    print(f"Server IP   : {host_ip}")
+    print(f"Uptime / Users:\n{run_cmd('w | head -n 2')}")
+
+    # Load Average
+    load = os.getloadavg() if hasattr(os, "getloadavg") else (0, 0, 0)
+    print(f"Load Avg    : {load[0]:.2f} / {load[1]:.2f} / {load[2]:.2f}")
+
+    # Memory Usage
+    print("\nMemory Usage:")
+    print(run_cmd("free -h"))
+
+    # Disk Usage
+    print("\nDisk Usage:")
+    print(run_cmd(r"df -hP | egrep 'Filesystem|/$|/home|/var'"))
+
+    # OOM Killer Events
+    print_header("OUT OF MEMORY (OOM) EVENTS")
+    oom_logs = run_cmd("grep -i invoked /var/log/messages | tail -n 5")
+    if oom_logs:
+        print(oom_logs)
+    else:
+        print("[+] Clean: No recent OOM killer events found in /var/log/messages.")
+
+    # 2. TOP MEMORY CONSUMING PROCESSES
+    print_header("TOP MEMORY CONSUMING PROCESSES")
+    ps_out = run_cmd("ps aux")
+    proc_mem = defaultdict(float)
+    if ps_out:
+        for line in ps_out.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) >= 11:
+                cmd_name = parts[10]
+                try:
+                    rss_kb = float(parts[5])
+                    proc_mem[cmd_name] += rss_kb
+                except ValueError:
+                    pass
+        sorted_procs = sorted(proc_mem.items(), key=lambda x: x[1], reverse=True)[:10]
+        for name, kb in sorted_procs:
+            if kb > 1024 * 1024:
+                size_str = f"{kb / (1024*1024):.2f} GB"
+            elif kb > 1024:
+                size_str = f"{kb / 1024:.2f} MB"
+            else:
+                size_str = f"{kb:.0f} KB"
+            print(f"  * {name:<45} : {size_str}")
+
+    # 3. NETWORK CONNECTIONS & SYN_RECV
+    print_header("ACTIVE NETWORK CONNECTIONS (PORTS 80/443)")
+    netstat_cmd = "netstat -nt 2>/dev/null | egrep ':80|:443' | awk '{print $5}' | awk -F: 'BEGIN { OFS = \":\"} {$(NF--)=\"\"; print}' | awk '{print substr($0, 1, length($0)-1)}' | sort | uniq -c | sort -rn | head -n 10"
+    conn_out = run_cmd(netstat_cmd)
+    print(conn_out if conn_out else "  [*] No active HTTP/HTTPS connections.")
+
+    print("\nSYN_RECV Requests Count:")
+    syn_count = run_cmd("netstat -nap 2>/dev/null | grep SYN_RECV -c")
+    print(f"  Total SYN_RECV: {syn_count if syn_count else '0'}")
+    syn_ips = run_cmd("netstat -nap 2>/dev/null | grep SYN_RECV | awk '{print $5}' | cut -d: -f1 | sort | uniq -c | sort -nr | head -n 5")
+    if syn_ips:
+        print("  Top SYN_RECV Source IPs:\n" + syn_ips)
+
+    # 4. APACHE CONFIG & ERROR AUDIT
+    print_header("APACHE BUILD & CONFIGURATION")
+    apache_ver = run_cmd("httpd -V 2>/dev/null | egrep '(version|MPM|Easy)' || apachectl -V 2>/dev/null | egrep '(version|MPM|Easy)'")
+    print(apache_ver if apache_ver else "  [*] Apache binary details unavailable.")
+
+    global_conf = "/etc/apache2/conf.d/includes/pre_virtualhost_global.conf"
+    if os.path.exists(global_conf):
+        print(f"\nContent of {global_conf}:")
+        print(run_cmd(f"cat {global_conf}"))
+
+    print("\nApache Scoreboard & MaxRequestWorkers Check:")
+    sb_errors = run_cmd("egrep -ia 'scoreboard|MaxRequestWorkers|AH03490' /usr/local/apache/logs/error_log | tail -n 5")
+    print(sb_errors if sb_errors else "  [+] Clean: No recent scoreboard or worker limit errors.")
+
+    # 5. LOG TRAFFIC & ABUSE ANALYSIS (cPanel domlogs)
+    print_header(f"TRAFFIC & ABUSE BREAKDOWN FOR TODAY ({today_str})")
+    log_files = glob.glob("/usr/local/apache/domlogs/*/*") + glob.glob("/usr/local/apache/domlogs/*")
+    log_files = [f for f in log_files if os.path.isfile(f) and not f.endswith(".gz") and not f.endswith("-bytes_log")]
+
+    if not log_files:
+        print("  [*] No cPanel access logs found in /usr/local/apache/domlogs/")
+    else:
+        ip_total = Counter()
+        ip_200 = Counter()
+        domain_traffic = Counter()
+        wplogin_domain = Counter()
+        wplogin_ip = Counter()
+        xmlrpc_domain = Counter()
+        xmlrpc_ip = Counter()
+        bot_counter = Counter()
+
+        bot_regex = re.compile(r"crawl|bot|spider|yahoo|bing|google|megaindex", re.IGNORECASE)
+
+        for lpath in log_files:
+            parts = lpath.split("/")
+            raw_dom = parts[-1].replace("-ssl_log", "")
+            if raw_dom in ["bytes_log", "ftpxferlog"]:
+                continue
+
+            try:
+                out = run_cmd(f"grep '{today_str}' '{lpath}' | tail -n 10000")
+                if not out:
+                    continue
+
+                for line in out.splitlines():
+                    lparts = line.split()
+                    if len(lparts) < 9:
+                        continue
+                    
+                    ip = lparts[0]
+                    status = lparts[8] if len(lparts) > 8 else ""
+                    
+                    ip_total[ip] += 1
+                    domain_traffic[raw_dom] += 1
+
+                    if status == "200":
+                        ip_200[ip] += 1
+
+                    if "wp-login.php" in line:
+                        wplogin_domain[raw_dom] += 1
+                        wplogin_ip[ip] += 1
+
+                    if "xmlrpc.php" in line:
+                        xmlrpc_domain[raw_dom] += 1
+                        xmlrpc_ip[ip] += 1
+
+                    if bot_regex.search(line):
+                        user_agent = " ".join(lparts[11:]) if len(lparts) > 11 else "Unknown"
+                        bot_counter[f"{ip} | {user_agent[:50]}"] += 1
+
+            except Exception:
+                pass
+
+        print("Top Requesting IPs Today (Total):")
+        for ip, cnt in ip_total.most_common(5):
+            print(f"  * {ip:<18} : {cnt} requests")
+
+        print("\nTop Requesting IPs Today (200 OK Responses Only):")
+        for ip, cnt in ip_200.most_common(5):
+            print(f"  * {ip:<18} : {cnt} requests")
+
+        print("\nTraffic by Domain:")
+        for dom, cnt in domain_traffic.most_common(5):
+            print(f"  * {dom:<35} : {cnt} requests")
+
+        print("\nwp-login.php Attacks by Domain:")
+        for dom, cnt in wplogin_domain.most_common(5):
+            print(f"  * {dom:<35} : {cnt} hits")
+
+        print("\nwp-login.php Attacks by IP:")
+        for ip, cnt in wplogin_ip.most_common(5):
+            print(f"  * {ip:<18} : {cnt} hits")
+
+        print("\nXMLRPC Abuse by Domain:")
+        for dom, cnt in xmlrpc_domain.most_common(5):
+            print(f"  * {dom:<35} : {cnt} hits")
+
+        print("\nXMLRPC Abuse by IP:")
+        for ip, cnt in xmlrpc_ip.most_common(5):
+            print(f"  * {ip:<18} : {cnt} hits")
+
+        print("\nTop Crawlers / Bots Detected:")
+        for bot_info, cnt in bot_counter.most_common(5):
+            print(f"  * {bot_info:<70} : {cnt} hits")
+
+    # 6. WEB SHELL & MALWARE AUDIT (WITH WHITELISTING)
+    print_header("WEB SHELL & SUSPICIOUS FILE AUDIT")
+    known_shells = ["wso.php", "alfa.php", "c99.php", "r57.php", "shell.php", "x.php", ".index.php"]
     
-    if args.traffic:
-        TrafficAudit.analyze_traffic(args.last)
-        
-    FileAudit.check_malware()
-    print("========================================================")
+    whitelist_patterns = [
+        "wp-includes/Text/Diff/Engine/shell.php",
+        "duplicator-pro/src/Libs/Shell/Shell.php",
+        "wordpress-seo/src/user-meta/framework/additional-contactmethods/x.php",
+        "wpforms-lite/lite/templates/admin/setup-wizard/shell.php",
+        "vendor/"
+    ]
+
+    found_shells = []
+    home_dirs = glob.glob("/home/*/public_html")
+
+    for hdir in home_dirs:
+        try:
+            for root, _, files in os.walk(hdir):
+                for f in files:
+                    full_path = os.path.join(root, f)
+                    if f.lower() in known_shells or (f.startswith(".") and f.endswith(".php")):
+                        if any(w_pat in full_path for w_pat in whitelist_patterns):
+                            continue
+                        found_shells.append(full_path)
+        except Exception:
+            pass
+
+    if found_shells:
+        print(f"  [!] CRITICAL: {len(found_shells)} Suspicious Web Shell(s) or Hidden PHP Script(s) Identified:")
+        for sh in found_shells[:15]:
+            print(f"      * {sh}")
+    else:
+        print("  [+] Clean: No unwhitelisted webshell filenames or hidden PHP scripts found in /home/*/public_html.")
+
+    print("\n========================================================")
 
 if __name__ == "__main__":
     main()
