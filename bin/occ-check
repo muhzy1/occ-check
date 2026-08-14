@@ -21,11 +21,11 @@ def main():
     today_str = datetime.now().strftime("%d/%b/%Y")
 
     print("========================================================")
-    print("      OCC EMERGENCY DIAGNOSTICS ENGINE (v3.0)")
+    print("      OCC EMERGENCY DIAGNOSTICS ENGINE (v4.0)")
     print(f"      Server Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Log Date: {today_str}")
     print("========================================================")
 
-    # 1. SERVER INFORMATION & HARDWARE METRICS
+    # 1. SERVER IDENTITY & HARDWARE / DISK WARNINGS
     print_header("SERVER IDENTITY & SYSTEM METRICS")
     hostname = run_cmd("hostname")
     try:
@@ -44,9 +44,18 @@ def main():
     print("\nMemory Usage:")
     print(run_cmd("free -h"))
 
-    # Disk Usage
+    # Disk Usage & Space Alerts
     print("\nDisk Usage:")
-    print(run_cmd(r"df -hP | egrep 'Filesystem|/$|/home|/var'"))
+    disk_info = run_cmd(r"df -hP | egrep 'Filesystem|/$|/home|/var'")
+    print(disk_info)
+    
+    # Check for near-full disks (>90%)
+    for line in disk_info.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 5:
+            pct_str = parts[4].replace("%", "")
+            if pct_str.isdigit() and int(pct_str) >= 90:
+                print(f"  [!] WARNING: Mount point '{parts[5]}' is critically full ({parts[4]} used)! High disk I/O wait expected.")
 
     # OOM Killer Events
     print_header("OUT OF MEMORY (OOM) EVENTS")
@@ -56,8 +65,13 @@ def main():
     else:
         print("[+] Clean: No recent OOM killer events found in /var/log/messages.")
 
-    # 2. TOP MEMORY CONSUMING PROCESSES
-    print_header("TOP MEMORY CONSUMING PROCESSES")
+    # 2. TOP CPU & MEMORY CONSUMING PROCESSES
+    print_header("TOP CPU & MEMORY CONSUMING PROCESSES")
+    print("Top 8 CPU-Consuming Processes (%CPU):")
+    top_cpu = run_cmd("ps aux --sort=-%cpu | head -n 9 | awk '{printf \"  * %-10s %-8s %-6s %-6s %s\\n\", $1, $2, $3\"%\", $4\"%\", $11}'")
+    print(top_cpu if top_cpu else "  [*] Unable to fetch process stats.")
+
+    print("\nTop 8 Memory-Consuming Processes (Grouped RSS):")
     ps_out = run_cmd("ps aux")
     proc_mem = defaultdict(float)
     if ps_out:
@@ -70,7 +84,7 @@ def main():
                     proc_mem[cmd_name] += rss_kb
                 except ValueError:
                     pass
-        sorted_procs = sorted(proc_mem.items(), key=lambda x: x[1], reverse=True)[:10]
+        sorted_procs = sorted(proc_mem.items(), key=lambda x: x[1], reverse=True)[:8]
         for name, kb in sorted_procs:
             if kb > 1024 * 1024:
                 size_str = f"{kb / (1024*1024):.2f} GB"
@@ -80,21 +94,37 @@ def main():
                 size_str = f"{kb:.0f} KB"
             print(f"  * {name:<45} : {size_str}")
 
-    # 3. NETWORK CONNECTIONS & SYN_RECV
-    print_header("ACTIVE NETWORK CONNECTIONS (PORTS 80/443)")
+    # 3. MARIADB / MYSQL DATABASE AUDIT
+    print_header("MARIADB / MYSQL REAL-TIME ACTIVITY")
+    db_proc = run_cmd("mysqladmin proc 2>/dev/null | head -n 15")
+    if db_proc:
+        print("Active Database Threads (mysqladmin proc):")
+        print(db_proc)
+    else:
+        print("  [*] mysqladmin proc unavailable or password required. Checking process count...")
+        db_count = run_cmd("pgrep -c mariadbd || pgrep -c mysqld")
+        print(f"  Active Database Engine Processes: {db_count if db_count else '0'}")
+
+    # 4. NETWORK CONNECTIONS & LOOPBACK ANALYSIS
+    print_header("ACTIVE NETWORK CONNECTIONS & LOOPBACK AUDIT")
     netstat_cmd = "netstat -nt 2>/dev/null | egrep ':80|:443' | awk '{print $5}' | awk -F: 'BEGIN { OFS = \":\"} {$(NF--)=\"\"; print}' | awk '{print substr($0, 1, length($0)-1)}' | sort | uniq -c | sort -rn | head -n 10"
     conn_out = run_cmd(netstat_cmd)
+    print("Top Active Remote IP Connections (Ports 80/443):")
     print(conn_out if conn_out else "  [*] No active HTTP/HTTPS connections.")
+
+    # Check for self-requesting loopback load
+    if host_ip != "N/A":
+        self_hits = run_cmd(f"netstat -nt 2>/dev/null | grep '{host_ip}' -c")
+        print(f"\nInternal / Self-Loop Connections from Server IP ({host_ip}): {self_hits}")
+        if int(self_hits if self_hits.isdigit() else 0) > 20:
+            print(f"  [!] CRITICAL: High internal traffic loop detected on {host_ip}! Local scripts/proxies are overloading webserver.")
 
     print("\nSYN_RECV Requests Count:")
     syn_count = run_cmd("netstat -nap 2>/dev/null | grep SYN_RECV -c")
     print(f"  Total SYN_RECV: {syn_count if syn_count else '0'}")
-    syn_ips = run_cmd("netstat -nap 2>/dev/null | grep SYN_RECV | awk '{print $5}' | cut -d: -f1 | sort | uniq -c | sort -nr | head -n 5")
-    if syn_ips:
-        print("  Top SYN_RECV Source IPs:\n" + syn_ips)
 
-    # 4. APACHE CONFIG & ERROR AUDIT
-    print_header("APACHE BUILD & CONFIGURATION")
+    # 5. APACHE BUILD & CONFIGURATION
+    print_header("APACHE BUILD & CONFIGURATION AUDIT")
     apache_ver = run_cmd("httpd -V 2>/dev/null | egrep '(version|MPM|Easy)' || apachectl -V 2>/dev/null | egrep '(version|MPM|Easy)'")
     print(apache_ver if apache_ver else "  [*] Apache binary details unavailable.")
 
@@ -103,11 +133,15 @@ def main():
         print(f"\nContent of {global_conf}:")
         print(run_cmd(f"cat {global_conf}"))
 
-    print("\nApache Scoreboard & MaxRequestWorkers Check:")
-    sb_errors = run_cmd("egrep -ia 'scoreboard|MaxRequestWorkers|AH03490' /usr/local/apache/logs/error_log | tail -n 5")
-    print(sb_errors if sb_errors else "  [+] Clean: No recent scoreboard or worker limit errors.")
+    print("\nApache Scoreboard & Worker Limit Audit:")
+    sb_errors = run_cmd(r"egrep -ia 'scoreboard|MaxRequestWorkers|AH03490|AH10159|AH00484' /usr/local/apache/logs/error_log | tail -n 5")
+    if sb_errors:
+        print(sb_errors)
+        print("  [!] ACTION REQUIRED: Apache limits reached! Consider increasing MaxRequestWorkers & ServerLimit in Event MPM.")
+    else:
+        print("  [+] Clean: No recent scoreboard or worker limit errors.")
 
-    # 5. LOG TRAFFIC & ABUSE ANALYSIS (cPanel domlogs)
+    # 6. LOG TRAFFIC & ABUSE ANALYSIS
     print_header(f"TRAFFIC & ABUSE BREAKDOWN FOR TODAY ({today_str})")
     log_files = glob.glob("/usr/local/apache/domlogs/*/*") + glob.glob("/usr/local/apache/domlogs/*")
     log_files = [f for f in log_files if os.path.isfile(f) and not f.endswith(".gz") and not f.endswith("-bytes_log")]
@@ -166,40 +200,37 @@ def main():
             except Exception:
                 pass
 
-        print("Top Requesting IPs Today (Total):")
+        print("Top Requesting IPs Today (Total Hits):")
         for ip, cnt in ip_total.most_common(5):
-            print(f"  * {ip:<18} : {cnt} requests")
+            alert = " [!] SERVER IP (Self-Loop)" if ip == host_ip else ""
+            print(f"  * {ip:<18} : {cnt} requests{alert}")
 
-        print("\nTop Requesting IPs Today (200 OK Responses Only):")
+        print("\nTop Requesting IPs Today (200 OK Status - Executed PHP):")
         for ip, cnt in ip_200.most_common(5):
             print(f"  * {ip:<18} : {cnt} requests")
 
-        print("\nTraffic by Domain:")
+        print("\nTraffic Breakdown by Domain:")
         for dom, cnt in domain_traffic.most_common(5):
             print(f"  * {dom:<35} : {cnt} requests")
 
-        print("\nwp-login.php Attacks by Domain:")
+        print("\nwp-login.php Brute Force Hits by Domain:")
         for dom, cnt in wplogin_domain.most_common(5):
             print(f"  * {dom:<35} : {cnt} hits")
 
-        print("\nwp-login.php Attacks by IP:")
+        print("\nwp-login.php Brute Force Hits by IP:")
         for ip, cnt in wplogin_ip.most_common(5):
             print(f"  * {ip:<18} : {cnt} hits")
 
-        print("\nXMLRPC Abuse by Domain:")
+        print("\nXMLRPC Hits by Domain:")
         for dom, cnt in xmlrpc_domain.most_common(5):
             print(f"  * {dom:<35} : {cnt} hits")
-
-        print("\nXMLRPC Abuse by IP:")
-        for ip, cnt in xmlrpc_ip.most_common(5):
-            print(f"  * {ip:<18} : {cnt} hits")
 
         print("\nTop Crawlers / Bots Detected:")
         for bot_info, cnt in bot_counter.most_common(5):
             print(f"  * {bot_info:<70} : {cnt} hits")
 
-    # 6. WEB SHELL & MALWARE AUDIT (WITH WHITELISTING)
-    print_header("WEB SHELL & SUSPICIOUS FILE AUDIT")
+    # 7. WEB SHELL & SUSPICIOUS FILE AUDIT
+    print_header("WEB SHELL & ACTIVE SUSPICIOUS FILE AUDIT")
     known_shells = ["wso.php", "alfa.php", "c99.php", "r57.php", "shell.php", "x.php", ".index.php"]
     
     whitelist_patterns = [
