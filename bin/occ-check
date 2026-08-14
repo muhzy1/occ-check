@@ -30,18 +30,16 @@ def colorize(text, level="INFO"):
     return text
 
 def run_cmd(cmd, timeout=5):
-    """Executes shell commands safely with a timeout to prevent hanging."""
+    """Executes shell commands safely with a timeout, backwards-compatible with Python < 3.7."""
     try:
         res = subprocess.run(
             cmd,
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            timeout=timeout,
-            text=True,
-            errors="ignore"
+            timeout=timeout
         )
-        return res.stdout.strip()
+        return res.stdout.decode("utf-8", errors="ignore").strip()
     except subprocess.TimeoutExpired:
         return f"[TIMEOUT] Command '{cmd}' timed out after {timeout}s"
     except Exception as e:
@@ -115,7 +113,7 @@ def main():
     today_str = datetime.now().strftime("%d/%b/%Y")
 
     print("========================================================")
-    print("      OCC EMERGENCY DIAGNOSTICS ENGINE (v4.1)")
+    print("      OCC EMERGENCY DIAGNOSTICS ENGINE (v4.1.1)")
     print(f"      Server Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Log Date: {today_str}")
     print("========================================================")
 
@@ -132,7 +130,12 @@ def main():
 
     # Load Average
     load = os.getloadavg() if hasattr(os, "getloadavg") else (0, 0, 0)
-    cpu_count = os.cpu_count() or 1
+    
+    try:
+        cpu_count = os.cpu_count() or 1
+    except AttributeError:
+        cpu_count = 1
+
     load_status = "OK"
     if load[0] > cpu_count * 2:
         load_status = "CRIT"
